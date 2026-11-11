@@ -14,12 +14,26 @@ export interface OverlayData {
     startedAt?: number;
     acceptKey: string;
     declineKey: string;
-    /** true — панель прижата к правому краю экрана */
-    right: boolean;
+    /** compact — горизонтальная панель, big — карточка с большой аватаркой */
+    layout: "compact" | "big";
+    /** масштаб, 1 = 100% */
+    scale: number;
 }
 
-export const OVERLAY_WIDTH = 560;
-export const OVERLAY_HEIGHT = 210;
+const BASE = {
+    compact: { width: 548, height: 204 },
+    big: { width: 348, height: 498 }
+};
+
+export function clampScale(scale: number) {
+    return Math.min(2, Math.max(0.5, Number(scale) || 1));
+}
+
+/** Размер окна оверлея для выбранного вида и масштаба. */
+export function overlaySize(layout: "compact" | "big", scale: number) {
+    const b = BASE[layout === "big" ? "big" : "compact"], s = clampScale(scale);
+    return { width: Math.ceil(b.width * s), height: Math.ceil(b.height * s) };
+}
 /** Длительность анимации закрытия, мс */
 export const CLOSE_MS = 420;
 
@@ -32,6 +46,7 @@ function esc(s: string) {
 export function buildOverlayHtml(d: OverlayData) {
     const out = d.mode === "out";
     const talk = d.mode === "talk";
+    const big = d.layout === "big";
     const name = esc(d.name);
     const bars = Array.from({ length: out ? 16 : 22 }, (_, i) =>
         `<i style="animation-delay:${out ? i * 90 - 1500 : -((i * 137) % 900)}ms"></i>`).join("");
@@ -47,7 +62,9 @@ export function buildOverlayHtml(d: OverlayData) {
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;font-family:var(--font)}
-body{display:flex;align-items:flex-start;padding:14px;${d.right ? "justify-content:flex-end;" : ""}}
+body{display:flex;align-items:flex-start;padding:14px;zoom:${clampScale(d.scale)}}
+.panel{cursor:grab}
+body.dragging .panel,body.dragging button{cursor:grabbing}
 
 /* ---------- каркас ---------- */
 .wrap{position:relative;width:520px;height:176px;filter:drop-shadow(0 0 10px rgba(0,240,255,.22))}
@@ -123,6 +140,17 @@ button:active{transform:translateY(1px)}
 .dec{background:var(--r);color:#fff}
 .dec kbd{color:#ff8298}
 .acc{animation:pulse 1.4s ease-in-out infinite}
+
+/* ---------- крупный вид: карточка с большой аватаркой ---------- */
+.big .wrap{width:320px;height:470px}
+.big .content{flex-direction:column;gap:14px;padding:22px 22px 20px 22px}
+.big .ava{width:100%;height:252px;clip-path:polygon(0 0,100% 0,100% calc(100% - 24px),calc(100% - 24px) 100%,0 100%)}
+.big .info{flex:1;width:100%}
+.big .name{font-size:26px;line-height:32px;margin-top:4px}
+.big .wave{margin-top:10px;justify-content:space-between}
+.big .btns{gap:8px}
+.big .btns button{flex:1;justify-content:center;padding:0 8px 0 6px;font-size:11px;letter-spacing:.08em;height:32px}
+.big .tag{top:8px}
 
 /* ---------- исходящий вызов ---------- */
 .mode-out .label{color:var(--c)}
@@ -200,7 +228,7 @@ body.no .panel::before{background:var(--r)}
   43%{opacity:.9;transform:translate(3px,0);clip-path:inset(0 0 50% 0)}45%{opacity:0}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
-<body class="mode-${esc(d.mode)}">
+<body class="mode-${esc(d.mode)}${big ? " big" : ""}">
 <div class="wrap">
   <div class="panel">
     <div class="corner"></div>
@@ -251,6 +279,26 @@ if (timer) {
   };
   tick(); setInterval(tick, 1000);
 }
+
+// Перетаскивание: страница только сообщает о начале и конце, окно двигает главный процесс.
+const panel = document.querySelector(".panel");
+let dragging = false;
+const endDrag = () => {
+  if (!dragging) return;
+  dragging = false;
+  document.body.classList.remove("dragging");
+  document.title = "cybercall:dragend:" + Date.now();
+};
+panel.addEventListener("pointerdown", e => {
+  if (e.button !== 0 || e.target.closest("button")) return;
+  dragging = true;
+  document.body.classList.add("dragging");
+  try { panel.setPointerCapture(e.pointerId); } catch {}
+  document.title = "cybercall:dragstart:" + Date.now();
+});
+panel.addEventListener("pointerup", endDrag);
+panel.addEventListener("pointercancel", endDrag);
+panel.addEventListener("lostpointercapture", endDrag);
 
 let audio = null;
 window.cyberClose = kind => {

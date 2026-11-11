@@ -10,7 +10,7 @@ import { extname } from "path";
 
 import defaultRingtone from "file://ringtone.mp3?base64";
 
-import { buildOverlayHtml, CLOSE_MS, OVERLAY_HEIGHT, OVERLAY_WIDTH } from "./overlay";
+import { buildOverlayHtml, clampScale, CLOSE_MS, overlaySize } from "./overlay";
 import { RELEASE_URL, runUpdate } from "./updater";
 
 export interface ShowOptions {
@@ -21,7 +21,13 @@ export interface ShowOptions {
     startedAt?: number;
     acceptKey: string;
     declineKey: string;
-    position: "top-left" | "top-right" | "bottom-left" | "bottom-right";
+    position: "top-left" | "top-right" | "bottom-left" | "bottom-right" | "custom";
+    /** сохранённое место панели, если её перетаскивали */
+    posX?: number;
+    posY?: number;
+    layout: "compact" | "big";
+    /** масштаб в процентах */
+    scale: number;
     ringtonePath: string;
     ringtoneVolume: number;
 }
@@ -60,7 +66,48 @@ function grabKey(key: string, action: Action) {
     }
 }
 
+/** Не даёт панели уехать за пределы экрана (например, если отключили монитор). */
+function fitToScreen(x: number, y: number, width: number, height: number) {
+    const b = screen.getDisplayNearestPoint({ x: Math.round(x + width / 2), y: Math.round(y + height / 2) }).bounds;
+    return {
+        x: Math.round(Math.min(Math.max(x, b.x), b.x + Math.max(0, b.width - width))),
+        y: Math.round(Math.min(Math.max(y, b.y), b.y + Math.max(0, b.height - height)))
+    };
+}
+
+let drag: { timer: ReturnType<typeof setInterval>; w: BrowserWindow; started: number; } | null = null;
+
+function stopDrag(save: boolean) {
+    const d = drag;
+    if (!d) return;
+    drag = null;
+    clearInterval(d.timer);
+    if (!save || d.w.isDestroyed()) return;
+
+    const { width, height } = d.w.getBounds();
+    const [wx, wy] = d.w.getPosition();
+    const { x, y } = fitToScreen(wx, wy, width, height);
+    d.w.setBounds({ x, y, width, height });
+    if (owner && !owner.isDestroyed())
+        owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onOverlayMoved(${x},${y})`).catch(() => { });
+}
+
+function startDrag(w: BrowserWindow) {
+    stopDrag(false);
+    const from = screen.getCursorScreenPoint();
+    const { x, y, width, height } = w.getBounds();
+    const timer = setInterval(() => {
+        // страховка: если отпускание мыши потерялось, не таскаем окно вечно
+        if (w.isDestroyed() || !drag || Date.now() - drag.started > 60_000) return stopDrag(!w.isDestroyed());
+        const p = screen.getCursorScreenPoint();
+        // размер задаём каждый раз заново: на экранах с масштабом окно иначе «ползёт»
+        w.setBounds({ x: x + p.x - from.x, y: y + p.y - from.y, width, height });
+    }, 16);
+    drag = { timer, w, started: Date.now() };
+}
+
 function destroy(w: BrowserWindow | null) {
+    if (drag?.w === w) stopDrag(false);
     if (w && !w.isDestroyed()) w.destroy();
 }
 
@@ -69,15 +116,20 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     releaseKeys();
     owner = e.sender;
 
+    const { width, height } = overlaySize(o.layout, o.scale / 100);
     const area = screen.getPrimaryDisplay().workArea;
-    const right = o.position.endsWith("right");
-    const bottom = o.position.startsWith("bottom");
+    let pos = {
+        x: o.position.endsWith("right") ? area.x + area.width - width : area.x,
+        y: o.position.startsWith("bottom") ? area.y + area.height - height : area.y
+    };
+    if (o.position === "custom" && Number.isFinite(o.posX) && Number.isFinite(o.posY))
+        pos = fitToScreen(o.posX!, o.posY!, width, height);
 
     const w = win = new BrowserWindow({
-        width: OVERLAY_WIDTH,
-        height: OVERLAY_HEIGHT,
-        x: right ? area.x + area.width - OVERLAY_WIDTH : area.x,
-        y: bottom ? area.y + area.height - OVERLAY_HEIGHT : area.y,
+        width,
+        height,
+        x: pos.x,
+        y: pos.y,
         frame: false,
         transparent: true,
         backgroundColor: "#00000000",
@@ -115,13 +167,17 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
 
     w.webContents.on("page-title-updated", (ev, title) => {
         ev.preventDefault();
-        const m = /^cybercall:(accept|decline|dismiss):/.exec(title);
-        if (m) notify(m[1] as Action);
+        const m = /^cybercall:(accept|decline|dismiss|dragstart|dragend):/.exec(title);
+        if (!m) return;
+        if (m[1] === "dragstart") startDrag(w);
+        else if (m[1] === "dragend") stopDrag(true);
+        else notify(m[1] as Action);
     });
 
     const html = buildOverlayHtml({
         name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
-        acceptKey: o.acceptKey, declineKey: o.declineKey, right
+        acceptKey: o.acceptKey, declineKey: o.declineKey,
+        layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100)
     });
     await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
     if (w.isDestroyed()) return;

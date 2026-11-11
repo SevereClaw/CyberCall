@@ -57,13 +57,31 @@ const settings = definePluginSettings({
     },
     position: {
         type: OptionType.SELECT,
-        description: "Угол экрана",
+        description: "Место на экране. Панель можно просто перетащить мышкой — место запомнится",
         options: [
+            { label: "Своё место (куда перетащил)", value: "custom" },
             { label: "Слева сверху", value: "top-left", default: true },
             { label: "Справа сверху", value: "top-right" },
             { label: "Слева снизу", value: "bottom-left" },
             { label: "Справа снизу", value: "bottom-right" }
         ]
+    },
+    posX: { type: OptionType.NUMBER, description: "X панели", default: 0, hidden: true },
+    posY: { type: OptionType.NUMBER, description: "Y панели", default: 0, hidden: true },
+    layout: {
+        type: OptionType.SELECT,
+        description: "Вид панели",
+        options: [
+            { label: "Обычная", value: "compact", default: true },
+            { label: "Крупная, с большой аватаркой", value: "big" }
+        ]
+    },
+    scale: {
+        type: OptionType.SLIDER,
+        description: "Размер панели, %",
+        markers: [50, 75, 100, 125, 150, 200],
+        default: 100,
+        stickToMarkers: false
     },
     ringtonePath: {
         type: OptionType.STRING,
@@ -158,6 +176,10 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         acceptKey: s.acceptKey,
         declineKey: s.declineKey,
         position: s.position as any,
+        posX: s.posX,
+        posY: s.posY,
+        layout: s.layout as any,
+        scale: s.scale,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume
     });
@@ -346,6 +368,14 @@ export default definePlugin({
         talkStart.clear();
         speakers.clear();
         if (shownChannelId) hide("missed");
+    },
+
+    /** Вызывается из главного процесса: панель перетащили на новое место. */
+    onOverlayMoved(x: number, y: number) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+        settings.store.posX = Math.round(x);
+        settings.store.posY = Math.round(y);
+        settings.store.position = "custom";
     },
 
     /** Вызывается из главного процесса: нажата кнопка или горячая клавиша. */
