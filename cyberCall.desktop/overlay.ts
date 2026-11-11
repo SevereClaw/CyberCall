@@ -18,6 +18,65 @@ export interface OverlayData {
     layout: "compact" | "big";
     /** масштаб, 1 = 100% */
     scale: number;
+    /** название готовой палитры или "custom" */
+    theme?: string;
+    /** свой акцентный цвет (#rrggbb) для палитры "custom" */
+    accent?: string;
+}
+
+export interface Theme { label: string; accent: string; second: string; danger: string; }
+
+export const THEMES: Record<string, Theme> = {
+    neon: { label: "Неон (жёлтый и циан)", accent: "#fcee0a", second: "#00f0ff", danger: "#ff2a4f" },
+    blue: { label: "Синий час", accent: "#4fc3ff", second: "#8f9bff", danger: "#ff4f7b" },
+    acid: { label: "Кислота (зелёный)", accent: "#b6ff3c", second: "#3cffc0", danger: "#ff4d4d" },
+    sunset: { label: "Закат (розовый и фиолетовый)", accent: "#ff5fd2", second: "#a98bff", danger: "#ff5a3c" },
+    blood: { label: "Янтарь и красный", accent: "#ffb02e", second: "#ff5a4f", danger: "#e0122f" },
+    mono: { label: "Монохром", accent: "#f2f5f8", second: "#9aa7b4", danger: "#ff4f5e" }
+};
+
+const HEX = /^#[0-9a-f]{6}$/i;
+
+function toRgb(hex: string) {
+    const n = parseInt(hex.slice(1), 16);
+    return [n >> 16 & 255, n >> 8 & 255, n & 255];
+}
+
+function rgbTriplet(hex: string) {
+    return toRgb(hex).join(" ");
+}
+
+/** Цвет текста, который читается поверх заливки. */
+function onColor(hex: string) {
+    const [r, g, b] = toRgb(hex).map(v => {
+        const c = v / 255;
+        return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.36 ? "#0a0a0a" : "#ffffff";
+}
+
+/** Поворачивает оттенок, сохраняя яркость: так из одного акцента получается парный цвет. */
+function rotateHue(hex: string, degrees: number) {
+    const [r, g, b] = toRgb(hex).map(v => v / 255);
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2, d = max - min;
+    let h = 0;
+    const sat = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+    if (d !== 0) {
+        if (max === r) h = ((g - b) / d) % 6;
+        else if (max === g) h = (b - r) / d + 2;
+        else h = (r - g) / d + 4;
+    }
+    h = ((h * 60 + degrees) % 360 + 360) % 360;
+    // парный цвет делаем не темнее 55 %, иначе подписи на тёмной панели не читаются
+    const l2 = Math.max(l, 0.55), c = (1 - Math.abs(2 * l2 - 1)) * sat, x = c * (1 - Math.abs(h / 60 % 2 - 1)), m = l2 - c / 2;
+    const [r2, g2, b2] = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    return "#" + [r2, g2, b2].map(v => Math.round((v + m) * 255).toString(16).padStart(2, "0")).join("");
+}
+
+export function resolveTheme(theme?: string, accent?: string): Theme {
+    if (theme === "custom" && accent && HEX.test(accent))
+        return { label: "", accent: accent.toLowerCase(), second: rotateHue(accent, 126), danger: THEMES.neon.danger };
+    return THEMES[theme ?? ""] ?? THEMES.neon;
 }
 
 const BASE = {
@@ -47,6 +106,7 @@ export function buildOverlayHtml(d: OverlayData) {
     const out = d.mode === "out";
     const talk = d.mode === "talk";
     const big = d.layout === "big";
+    const t = resolveTheme(d.theme, d.accent);
     const name = esc(d.name);
     const bars = Array.from({ length: out ? 16 : 22 }, (_, i) =>
         `<i style="animation-delay:${out ? i * 90 - 1500 : -((i * 137) % 900)}ms"></i>`).join("");
@@ -57,7 +117,8 @@ export function buildOverlayHtml(d: OverlayData) {
 <title>cybercall</title>
 <style>
 :root{
-  --y:#fcee0a; --c:#00f0ff; --r:#ff2a4f; --bg:rgba(8,10,14,.93);
+  --y:${t.accent}; --c:${t.second}; --r:${t.danger}; --bg:rgba(8,10,14,.93);
+  --y-rgb:${rgbTriplet(t.accent)}; --c-rgb:${rgbTriplet(t.second)}; --on-y:${onColor(t.accent)}; --on-r:${onColor(t.danger)};
   --font:"Bahnschrift","Segoe UI Semibold","Segoe UI","DejaVu Sans",sans-serif;
 }
 *{box-sizing:border-box;margin:0;padding:0}
@@ -67,7 +128,7 @@ body{display:flex;align-items:flex-start;padding:14px;zoom:${clampScale(d.scale)
 body.dragging .panel,body.dragging button{cursor:grabbing}
 
 /* ---------- каркас ---------- */
-.wrap{position:relative;width:520px;height:176px;filter:drop-shadow(0 0 10px rgba(0,240,255,.22))}
+.wrap{position:relative;width:520px;height:176px;filter:drop-shadow(0 0 10px rgb(var(--c-rgb) / .22))}
 .panel{
   position:absolute;inset:0;background:var(--bg);
   clip-path:polygon(0 0,calc(100% - 26px) 0,100% 26px,100% 100%,22px 100%,0 calc(100% - 22px));
@@ -86,9 +147,9 @@ body.dragging .panel,body.dragging button{cursor:grabbing}
   background:repeating-linear-gradient(0deg,rgba(255,255,255,.035) 0 1px,transparent 1px 3px);
 }
 .sweep{position:absolute;left:0;right:0;height:38px;top:-40px;pointer-events:none;
-  background:linear-gradient(180deg,transparent,rgba(0,240,255,.13),transparent);
+  background:linear-gradient(180deg,transparent,rgb(var(--c-rgb) / .13),transparent);
   animation:sweep 2.6s linear infinite .6s}
-.tag{position:absolute;right:34px;top:7px;font-size:9px;letter-spacing:.22em;color:rgba(0,240,255,.55)}
+.tag{position:absolute;right:34px;top:7px;font-size:9px;letter-spacing:.22em;color:rgb(var(--c-rgb) / .55)}
 .corner{position:absolute;left:0;top:0;width:64px;height:5px;background:var(--y)}
 
 .content{position:absolute;inset:0;display:flex;gap:18px;padding:20px 22px 18px 22px;
@@ -101,7 +162,7 @@ body.dragging .panel,body.dragging button{cursor:grabbing}
 .ava::after{content:"";position:absolute;inset:0;border:1px solid var(--c);pointer-events:none;transition:border-color .15s}
 .ava img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .ava .base{filter:saturate(.75) contrast(1.15) brightness(.95)}
-.ava .tint{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,240,255,.28),rgba(0,240,255,.08));mix-blend-mode:screen}
+.ava .tint{position:absolute;inset:0;background:linear-gradient(180deg,rgb(var(--c-rgb) / .28),rgb(var(--c-rgb) / .08));mix-blend-mode:screen}
 .ava .gr{mix-blend-mode:screen;opacity:0;filter:saturate(3) hue-rotate(-35deg);animation:splitR 3.1s steps(1) infinite}
 .ava .gc{mix-blend-mode:screen;opacity:0;filter:saturate(3) hue-rotate(150deg);animation:splitC 3.1s steps(1) infinite}
 .ava .slice{animation:slice 3.1s steps(1) infinite;opacity:0}
@@ -115,12 +176,12 @@ body.dragging .panel,body.dragging button{cursor:grabbing}
 .label b{width:8px;height:8px;background:var(--r);box-shadow:0 0 8px var(--r);animation:blink 1s steps(2) infinite}
 .name{position:relative;margin-top:6px;font-size:30px;line-height:36px;font-weight:700;letter-spacing:.03em;
   color:#f4f7fa;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
-  text-shadow:0 0 12px rgba(0,240,255,.45)}
+  text-shadow:0 0 12px rgb(var(--c-rgb) / .45)}
 .name::before,.name::after{content:attr(data-t);position:absolute;left:0;top:0;width:100%;overflow:hidden;
   white-space:nowrap;text-overflow:ellipsis;opacity:0}
 .name::before{color:var(--r);animation:txtR 2.7s steps(1) infinite}
 .name::after{color:var(--c);animation:txtC 2.7s steps(1) infinite}
-.sub{font-size:12px;letter-spacing:.12em;color:rgba(0,240,255,.8);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sub{font-size:12px;letter-spacing:.12em;color:rgb(var(--c-rgb) / .8);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
 .wave{display:flex;align-items:center;gap:3px;height:20px;margin-top:8px}
 .wave i{width:3px;height:100%;background:var(--c);transform-origin:center;animation:wave .9s ease-in-out infinite;opacity:.85}
@@ -135,9 +196,10 @@ button kbd{font:700 11px var(--font);min-width:24px;height:20px;padding:0 5px;di
   background:rgba(0,0,0,.82)}
 button:hover{filter:brightness(1.25)}
 button:active{transform:translateY(1px)}
-.acc{background:var(--y);color:#0a0a0a}
+.acc{background:var(--y);color:var(--on-y)}
+.acc kbd{background:var(--on-y)}
 .acc kbd{color:var(--y)}
-.dec{background:var(--r);color:#fff}
+.dec{background:var(--r);color:var(--on-r)}
 .dec kbd{color:#ff8298}
 .acc{animation:pulse 1.4s ease-in-out infinite}
 
@@ -184,8 +246,8 @@ button:active{transform:translateY(1px)}
 .mode-talk.speaking .ava .gc{animation:splitC 1.4s steps(1) infinite}
 .mode-talk.speaking .ava .lines{animation:roll 1s linear infinite}
 .mode-talk.speaking .wave i{animation:wave .9s ease-in-out infinite;opacity:.9;background:var(--y)}
-.mode-talk.speaking .name{text-shadow:0 0 14px rgba(252,238,10,.5)}
-.ghost{background:transparent;color:rgba(0,240,255,.85);outline:1px solid rgba(0,240,255,.5);outline-offset:-1px;padding:0 12px}
+.mode-talk.speaking .name{text-shadow:0 0 14px rgb(var(--y-rgb) / .5)}
+.ghost{background:transparent;color:rgb(var(--c-rgb) / .85);outline:1px solid rgb(var(--c-rgb) / .5);outline-offset:-1px;padding:0 12px}
 @keyframes talk{0%,100%{transform:translateY(0) scale(1)}30%{transform:translateY(-3px) scale(1.035)}65%{transform:translateY(1px) scale(.99)}}
 @keyframes talkImg{0%,100%{transform:scale(1.02)}50%{transform:scale(1.09)}}
 

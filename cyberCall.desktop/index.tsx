@@ -10,6 +10,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
 import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
 
+import { THEMES } from "./overlay";
 import { installRingMuter, setRingMuted, uninstallRingMuter } from "./muteRing";
 
 const Native = VencordNative.pluginHelpers.CyberCall as PluginNative<typeof import("./native")>;
@@ -44,6 +45,24 @@ let updateReady = false;
 
 const UPDATE_INTERVAL = 3 * 60 * 60 * 1000;
 
+function AccentPicker() {
+    const { accent, theme } = settings.use(["accent", "theme"]);
+    return (
+        <label style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-default, var(--header-primary))" }}>
+            <input
+                type="color"
+                value={accent || "#fcee0a"}
+                onChange={e => {
+                    settings.store.accent = e.currentTarget.value;
+                    settings.store.theme = "custom";
+                }}
+                style={{ width: 44, height: 28, padding: 0, border: "none", background: "none", cursor: "pointer" }}
+            />
+            Свой акцентный цвет{theme === "custom" ? "" : " (выбор цвета включит его)"} — второй цвет подберётся сам
+        </label>
+    );
+}
+
 const settings = definePluginSettings({
     acceptKey: {
         type: OptionType.STRING,
@@ -65,6 +84,32 @@ const settings = definePluginSettings({
             { label: "Слева снизу", value: "bottom-left" },
             { label: "Справа снизу", value: "bottom-right" }
         ]
+    },
+    monitor: {
+        type: OptionType.SELECT,
+        description: "Монитор (для панели в углу; перетащенная панель остаётся там, куда её поставили)",
+        options: [
+            { label: "Там, где сейчас курсор мыши", value: "cursor", default: true },
+            { label: "Основной", value: "primary" },
+            { label: "Монитор 1 (счёт слева направо)", value: "1" },
+            { label: "Монитор 2", value: "2" },
+            { label: "Монитор 3", value: "3" },
+            { label: "Монитор 4", value: "4" }
+        ]
+    },
+    theme: {
+        type: OptionType.SELECT,
+        description: "Цвета",
+        options: [
+            ...Object.entries(THEMES).map(([value, t], i) => ({ label: t.label, value, default: i === 0 })),
+            { label: "Свой акцентный цвет", value: "custom" }
+        ]
+    },
+    accent: {
+        type: OptionType.COMPONENT,
+        description: "Свой акцентный цвет",
+        default: "#fcee0a",
+        component: AccentPicker
     },
     posX: { type: OptionType.NUMBER, description: "X панели", default: 0, hidden: true },
     posY: { type: OptionType.NUMBER, description: "Y панели", default: 0, hidden: true },
@@ -180,6 +225,9 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         posY: s.posY,
         layout: s.layout as any,
         scale: s.scale,
+        theme: s.theme as string,
+        accent: s.accent as string,
+        monitor: s.monitor as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume
     });

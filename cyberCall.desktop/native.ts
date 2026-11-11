@@ -28,6 +28,10 @@ export interface ShowOptions {
     layout: "compact" | "big";
     /** масштаб в процентах */
     scale: number;
+    theme: string;
+    accent: string;
+    /** на каком мониторе показывать, если панель стоит в углу */
+    monitor: string;
     ringtonePath: string;
     ringtoneVolume: number;
 }
@@ -64,6 +68,17 @@ function grabKey(key: string, action: Action) {
     } catch {
         // неверное название клавиши — просто работаем без неё
     }
+}
+
+/** Монитор для панели в углу: основной, тот, где курсор, или по номеру слева направо. */
+function pickDisplay(monitor: string) {
+    if (monitor === "cursor") return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const index = Number(monitor);
+    if (Number.isInteger(index) && index >= 1) {
+        const all = screen.getAllDisplays().sort((a, b) => a.bounds.x - b.bounds.x || a.bounds.y - b.bounds.y);
+        if (all[index - 1]) return all[index - 1];
+    }
+    return screen.getPrimaryDisplay();
 }
 
 /** Не даёт панели уехать за пределы экрана (например, если отключили монитор). */
@@ -117,7 +132,7 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     owner = e.sender;
 
     const { width, height } = overlaySize(o.layout, o.scale / 100);
-    const area = screen.getPrimaryDisplay().workArea;
+    const area = pickDisplay(o.monitor).workArea;
     let pos = {
         x: o.position.endsWith("right") ? area.x + area.width - width : area.x,
         y: o.position.startsWith("bottom") ? area.y + area.height - height : area.y
@@ -177,7 +192,8 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     const html = buildOverlayHtml({
         name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
         acceptKey: o.acceptKey, declineKey: o.declineKey,
-        layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100)
+        layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100),
+        theme: o.theme, accent: o.accent
     });
     await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
     if (w.isDestroyed()) return;
