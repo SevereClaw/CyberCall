@@ -14,9 +14,17 @@ let recent: WeakRef<HTMLAudioElement>[] = [];
 let mutedByUs: WeakRef<HTMLAudioElement>[] = [];
 let timers: ReturnType<typeof setTimeout>[] = [];
 
+/** счётчики для журнала: видно, ловит ли плагин звуки Discord вообще */
+let seenPlays = 0, seenLoops = 0, silenced = 0;
+
+export function ringMuterReport() {
+    return `звуки Discord: запусков=${seenPlays}, из них зацикленных=${seenLoops}, заглушено=${silenced}, перехват=${originalPlay ? "стоит" : "нет"}`;
+}
+
 function silence(el: HTMLAudioElement) {
     if (!el.loop || el.muted) return;
     el.muted = true;
+    silenced++;
     mutedByUs.push(new WeakRef(el));
 }
 
@@ -37,6 +45,8 @@ export function installRingMuter() {
         try {
             // только «висящие в воздухе» звуки интерфейса, а не видео и не плееры на странице
             if (this instanceof HTMLAudioElement && !this.isConnected) {
+                seenPlays++;
+                if (this.loop) seenLoops++;
                 if (!recent.some(r => r.deref() === this)) {
                     recent.push(new WeakRef(this));
                     if (recent.length > 40) recent = recent.filter(r => r.deref()).slice(-40);

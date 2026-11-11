@@ -51,7 +51,18 @@ async function download(asset: Asset, onProgress: (percent: number) => void) {
     await mkdir(dir(), { recursive: true });
     const tmp = path + ".part";
     try {
-        const res = await net.fetch(ASSET_URL + asset.file);
+        // сторож: если сервер молчит полминуты (нет ответа или загрузка встала), обрываем с понятной ошибкой
+        const abort = new AbortController();
+        let watchdog: ReturnType<typeof setTimeout>;
+        const alive = () => {
+            clearTimeout(watchdog);
+            watchdog = setTimeout(() => abort.abort(), 30_000);
+        };
+        alive();
+        onProgress(0);
+        const res = await net.fetch(ASSET_URL + asset.file, { signal: abort.signal }).catch(e => {
+            throw new Error(abort.signal.aborted ? "GitHub не отвечает (проверь интернет или VPN)" : String(e?.message ?? e));
+        });
         if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
 
         const hash = createHash("sha256");
@@ -59,7 +70,10 @@ async function download(asset: Asset, onProgress: (percent: number) => void) {
         const reader = res.body.getReader();
         let done = 0, shown = -1;
         for (; ;) {
-            const chunk = await reader.read();
+            const chunk = await reader.read().catch(e => {
+                throw new Error(abort.signal.aborted ? "загрузка остановилась (проверь интернет или VPN)" : String(e?.message ?? e));
+            });
+            alive();
             if (chunk.done) break;
             hash.update(chunk.value);
             if (!out.write(chunk.value)) await new Promise(r => out.once("drain", r));
@@ -67,6 +81,7 @@ async function download(asset: Asset, onProgress: (percent: number) => void) {
             const percent = Math.min(99, Math.floor(done / asset.size * 100));
             if (percent !== shown) onProgress(shown = percent);
         }
+        clearTimeout(watchdog!);
         await new Promise<void>((resolve, reject) => out.end((e?: Error | null) => e ? reject(e) : resolve()));
 
         if (hash.digest("hex") !== asset.sha256) throw new Error("файл повреждён при загрузке");
@@ -90,6 +105,7 @@ function ensure(asset: Asset, onProgress: (percent: number) => void) {
 /** Скачивает движок и модель языка, если их ещё нет. Возвращает пути к файлам. */
 export async function prepareStt(lang: string, onStatus: (text: string) => void) {
     const model = MODELS[sttLang(lang)];
+    onStatus("Подготовка распознавания речи…");
     const engine = await ensure(ENGINE, p => onStatus(`Загрузка распознавания речи… ${Math.round(p / 8)}%`));
     const modelPath = await ensure(model, p => onStatus(`Загрузка распознавания речи… ${12 + Math.round(p * 0.88)}%`));
     return { engine, model: modelPath };

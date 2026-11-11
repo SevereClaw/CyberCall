@@ -204,8 +204,11 @@ window.cyberSubsStart = async cfg => {
     };
     if (ctx.state === "suspended") await ctx.resume();
     cyberSubsStatus("Субтитры включены", 2500);
+    document.title = "cybercall:log:" + encodeURIComponent("субтитры включены, частота " + ctx.sampleRate);
   } catch (e) {
-    cyberSubsStatus("Субтитры не запустились: " + (e && e.message || e), 20000);
+    const text = "Субтитры не запустились: " + (e && e.message || e);
+    cyberSubsStatus(text, 20000);
+    document.title = "cybercall:log:" + encodeURIComponent(text + (e && e.name ? " [" + e.name + "]" : ""));
   }
 };
 `;

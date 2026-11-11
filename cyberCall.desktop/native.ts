@@ -7,7 +7,7 @@
 import { BrowserWindow, globalShortcut, IpcMainInvokeEvent, net, screen, WebContents } from "electron";
 import { randomBytes } from "crypto";
 import { readFile, stat } from "fs/promises";
-import { extname } from "path";
+import { extname, join } from "path";
 
 import defaultRingtone from "file://ringtone.mp3?base64";
 
@@ -54,6 +54,12 @@ const MIME: Record<string, string> = {
 let win: BrowserWindow | null = null;
 let owner: WebContents | null = null;
 let keys: string[] = [];
+
+/** Пишет строку в журнал плагина (его можно скопировать из настроек). */
+function log(text: string) {
+    if (!owner || owner.isDestroyed()) return;
+    owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onNativeLog(${JSON.stringify(String(text).slice(0, 400))})`).catch(() => { });
+}
 
 function notify(action: Action) {
     if (!owner || owner.isDestroyed()) return;
@@ -134,9 +140,18 @@ function destroy(w: BrowserWindow | null) {
 }
 
 export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
+    owner = e.sender;
+    try {
+        await openCall(o);
+    } catch (err) {
+        log("окно не открылось: " + String((err as Error)?.message ?? err));
+        throw err;
+    }
+}
+
+async function openCall(o: ShowOptions) {
     destroy(win);
     releaseKeys();
-    owner = e.sender;
 
     const subs = o.mode === "talk" && !!o.subtitles;
     if (subs) sttSession();
@@ -193,6 +208,10 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     w.webContents.on("page-title-updated", (ev, title) => {
         ev.preventDefault();
         const m = /^cybercall:(accept|decline|dismiss|dragstart|dragend):/.exec(title);
+        if (title.startsWith("cybercall:log:")) {
+            try { log("панель: " + decodeURIComponent(title.slice(14))); } catch { }
+            return;
+        }
         if (!m) return;
         if (m[1] === "dragstart") startDrag(w);
         else if (m[1] === "dragend") stopDrag(true);
@@ -216,12 +235,27 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
             w.on("closed", () => s.close());
             // на случайном порту кэш модели не переиспользуется — чистим, чтобы он не копился
             if (!s.stablePort) await sttSession().clearStorageData({ storages: ["indexdb"] }).catch(() => { });
-        } catch {
+        } catch (err) {
+            log("субтитры: локальный сервер не запустился: " + String((err as Error)?.message ?? err));
             server = null;
         }
     }
 
-    await w.loadURL(server ? server.pageUrl : "data:text/html;charset=utf-8," + encodeURIComponent(html));
+    const dataUrl = "data:text/html;charset=utf-8," + encodeURIComponent(html);
+    if (server) {
+        try {
+            await w.loadURL(server.pageUrl);
+        } catch (err) {
+            // панель важнее субтитров: если страница с локального адреса не открылась, показываем обычную
+            log("субтитры: страница не открылась: " + String((err as Error)?.message ?? err));
+            server.close();
+            server = null;
+            if (w.isDestroyed()) return;
+            await w.loadURL(dataUrl);
+        }
+    } else {
+        await w.loadURL(dataUrl);
+    }
     if (w.isDestroyed()) return;
 
     w.showInactive();
@@ -271,15 +305,21 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
     };
     const status = (text: string, hold = 0) => exec(`cyberSubsStatus(${JSON.stringify(text)},${hold})`);
 
-    if (!server) return status("Субтитры не запустились: не удалось открыть локальный порт", 20000);
+    if (!server) return status("Субтитры не запустились: не удалось открыть локальную страницу", 20000);
 
+    status("Подготовка распознавания речи…");
     prepareStt(sttLang(lang), text => status(text))
         .then(files => {
+            log("субтитры: файлы готовы, запускаю распознавание (" + sttLang(lang) + ")");
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
             exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl })})`, true);
         })
-        .catch(e => status("Не удалось скачать распознавание речи: " + String(e?.message ?? e), 20000));
+        .catch(e => {
+            const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);
+            log("субтитры: " + text);
+            status(text, 20000);
+        });
 }
 
 function run(js: string) {
@@ -294,6 +334,15 @@ export function setSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
 /** В групповом звонке сменился говорящий. */
 export function setSpeaker(_: IpcMainInvokeEvent, info: { name: string; sub: string; avatar: string; }) {
     run(`cyberUser(${JSON.stringify(String(info.name))},${JSON.stringify(String(info.sub))},${JSON.stringify(String(info.avatar))})`);
+}
+
+/** Какая сборка сейчас установлена. */
+export async function getVersion(_: IpcMainInvokeEvent) {
+    try {
+        return String(JSON.parse(await readFile(join(__dirname, "version.json"), "utf-8")).tag);
+    } catch {
+        return "ручная сборка";
+    }
 }
 
 /** Проверяет релизы на GitHub и, если вышла новая сборка, скачивает её. */

@@ -5,13 +5,14 @@
 import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import { Button } from "@components/Button";
+import { copyToClipboard } from "@utils/clipboard";
 import { relaunch } from "@utils/native";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
+import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore, useEffect, useState } from "@webpack/common";
 
 import { THEMES } from "./overlay";
-import { installRingMuter, setRingMuted, uninstallRingMuter } from "./muteRing";
+import { installRingMuter, ringMuterReport, setRingMuted, uninstallRingMuter } from "./muteRing";
 
 const Native = VencordNative.pluginHelpers.CyberCall as PluginNative<typeof import("./native")>;
 const VoiceActions = findByPropsLazy("selectVoiceChannel", "selectChannel");
@@ -43,7 +44,32 @@ let updateTimer: ReturnType<typeof setInterval> | undefined;
 /** новая сборка уже скачана и ждёт перезапуска */
 let updateReady = false;
 
-const UPDATE_INTERVAL = 3 * 60 * 60 * 1000;
+const UPDATE_INTERVAL = 30 * 60 * 1000;
+
+/** Журнал последних событий: по нему видно, что плагин увидел и что решил показать. */
+const journal: string[] = [];
+let lastSyncState = "";
+function log(text: string) {
+    journal.push(new Date().toLocaleTimeString("ru-RU") + " " + text);
+    if (journal.length > 120) journal.shift();
+}
+
+async function copyJournal() {
+    const s = settings.store;
+    const head = [
+        "CyberCall " + await Native.getVersion().catch(() => "?"),
+        `настройки: субтитры=${s.subtitles}/${s.subtitleLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
+        ringMuterReport()
+    ];
+    await copyToClipboard([...head, ...journal].join("\n"));
+    showNotification({ title: "CyberCall", body: "Журнал скопирован. Вставь его в чат.", noPersist: true });
+}
+
+function VersionLine() {
+    const [version, setVersion] = useState("…");
+    useEffect(() => { Native.getVersion().then(setVersion, () => setVersion("?")); }, []);
+    return <div style={{ color: "var(--text-muted)", fontSize: 12, marginTop: 8 }}>Установлена сборка: {version}</div>;
+}
 
 function AccentPicker() {
     const { accent, theme } = settings.use(["accent", "theme"]);
@@ -162,8 +188,8 @@ const settings = definePluginSettings({
     },
     subtitles: {
         type: OptionType.BOOLEAN,
-        description: "Субтитры: текст речи собеседника под панелью разговора. Распознаётся на компьютере, звук никуда не отправляется. При первом включении скачает около 45 МБ, во время звонка занимает заметно больше памяти",
-        default: false
+        description: "Субтитры: текст речи собеседника под панелью разговора. Распознаётся на компьютере, звук никуда не отправляется. При первом звонке скачает около 45 МБ, во время звонка занимает около 400 МБ памяти",
+        default: true
     },
     subtitleLang: {
         type: OptionType.SELECT,
@@ -182,11 +208,15 @@ const settings = definePluginSettings({
         type: OptionType.COMPONENT,
         description: "Проверка",
         component: () => (
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                <Button onClick={() => showTest("in")}>Тест входящего</Button>
-                <Button onClick={() => showTest("out")}>Тест исходящего</Button>
-                <Button onClick={() => showTest("talk")}>Тест разговора</Button>
-                <Button variant="secondary" onClick={() => checkUpdate(true)}>Проверить обновления</Button>
+            <div>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <Button onClick={() => showTest("in")}>Тест входящего</Button>
+                    <Button onClick={() => showTest("out")}>Тест исходящего</Button>
+                    <Button onClick={() => showTest("talk")}>Тест разговора</Button>
+                    <Button variant="secondary" onClick={() => checkUpdate(true)}>Проверить обновления</Button>
+                    <Button variant="secondary" onClick={() => copyJournal()}>Скопировать журнал</Button>
+                </div>
+                <VersionLine />
             </div>
         )
     }
@@ -233,6 +263,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     const s = settings.store;
     const ownRingtone = s.ringtoneVolume > 0 && (mode === "in" || (mode === "out" && s.ringtoneOutgoing));
     setRingMuted(ownRingtone && channelId !== TEST_ID && s.muteDiscordRing);
+    log(`показываю панель: ${mode}${channelId === TEST_ID ? " (тест)" : ""}, свой рингтон=${ownRingtone}, субтитры=${mode === "talk" && s.subtitles}`);
     Native.showCall({
         ...info,
         mode,
@@ -252,10 +283,11 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
         ringtoneOutgoing: s.ringtoneOutgoing
-    });
+    }).catch(e => log("ошибка показа панели: " + String(e?.message ?? e)));
 }
 
 function hide(kind: "accept" | "decline" | "missed") {
+    log(`скрываю панель: ${shownMode} (${kind})`);
     shownChannelId = null;
     shownSpeaker = null;
     lastHideAt = Date.now();
@@ -346,6 +378,9 @@ function sync() {
     if (talking && !talkStart.has(talking)) talkStart.set(talking, Date.now());
     if (!talking) speakers.clear();
     const talk = talking && settings.store.showInCall && !dismissedTalk.has(talking) ? talking : null;
+
+    const state = `звонков=${calls.length} [${calls.map(c => `гудки:${c.ringing?.length ?? 0}${c.ringing?.includes(meId) ? "(мне)" : ""}`).join(" ")}] я в голосе=${Boolean(voiceId)} в звонке=${Boolean(voiceId && live.has(voiceId))} → входящий=${ringing.size} исходящий=${Boolean(outgoing)} разговор=${Boolean(talk)}`;
+    if (state !== lastSyncState) log(lastSyncState = state);
 
     if (shownChannelId && shownChannelId !== TEST_ID) {
         if (shownMode === "talk" && talk !== shownChannelId) {
@@ -438,6 +473,11 @@ export default definePlugin({
         talkStart.clear();
         speakers.clear();
         if (shownChannelId) hide("missed");
+    },
+
+    /** Вызывается из главного процесса: строка для журнала. */
+    onNativeLog(text: string) {
+        log(String(text));
     },
 
     /** Вызывается из главного процесса: панель перетащили на новое место. */
