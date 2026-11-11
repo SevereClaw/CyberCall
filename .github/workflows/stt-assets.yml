@@ -1,0 +1,62 @@
+name: STT assets
+
+# Служебный релиз с файлами распознавания речи для субтитров (движок и языковые модели).
+# Плагин скачивает их сам при первом включении субтитров. Запускается один раз:
+# если релиз уже есть, ничего не делает.
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/stt-assets.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAG: stt-1
+  MODELS_COMMIT: a4b0d0fe60359e5ea9800f810f6b6f6c1d2b03c6
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect files
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          npm pack vosk-browser@0.0.8
+          tar xzf vosk-browser-0.0.8.tgz
+          cp package/dist/vosk.js vosk.js
+          BASE="https://raw.githubusercontent.com/ccoreilly/vosk-browser/$MODELS_COMMIT/models"
+          curl -L --fail -o model-ru.tar.gz "$BASE/vosk-model-small-ru-0.4.tar.gz"
+          curl -L --fail -o model-en.tar.gz "$BASE/vosk-model-small-en-us-0.15.tar.gz"
+          # те же контрольные суммы зашиты в плагине (stt.ts)
+          sha256sum -c <<'SUMS'
+          29504515526e974f4cb053cf08811c4de5fb2a74007c0a5a957db50eaa8d5d0c  vosk.js
+          b855cf79a513023af4090739caa407203754d7db98ccb3b8d4162f5d7f6a3f8e  model-ru.tar.gz
+          f0b24bb92a48ca575b6a96500d6b543f0f079c573dfe85bbe16001fc0404e1d8  model-en.tar.gz
+          SUMS
+
+      - name: Publish
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          Служебный релиз: эти файлы плагин скачивает сам, когда включены субтитры. Вручную ставить ничего не нужно.
+
+          - `vosk.js` — движок распознавания vosk-browser 0.0.8 (Apache-2.0), https://github.com/ccoreilly/vosk-browser
+          - `model-ru.tar.gz` — vosk-model-small-ru-0.4 (Apache-2.0), https://alphacephei.com/vosk/models
+          - `model-en.tar.gz` — vosk-model-small-en-us-0.15 (Apache-2.0), https://alphacephei.com/vosk/models
+          NOTES
+          gh release create "$TAG" vosk.js model-ru.tar.gz model-en.tar.gz -R "$GITHUB_REPOSITORY" \
+            --title "Файлы распознавания речи для субтитров" --notes-file notes.md --latest=false

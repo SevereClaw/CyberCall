@@ -18,5 +18,7 @@ set "VENCORD_USER_DATA_DIR=%TARGET%"
 set "VENCORD_DEV_INSTALL=1"
 "%INSTALLER%" -uninstall -branch auto
 rmdir /S /Q "%TARGET%"
+if exist "%APPDATA%\discord\CyberCall" rmdir /S /Q "%APPDATA%\discord\CyberCall"
+if exist "%APPDATA%\discord\Partitions\cybercall-stt" rmdir /S /Q "%APPDATA%\discord\Partitions\cybercall-stt"
 echo Удалено. Discord снова обычный.
 pause

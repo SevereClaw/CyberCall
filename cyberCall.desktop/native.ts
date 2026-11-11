@@ -5,12 +5,14 @@
  */
 
 import { BrowserWindow, globalShortcut, IpcMainInvokeEvent, net, screen, WebContents } from "electron";
+import { randomBytes } from "crypto";
 import { readFile, stat } from "fs/promises";
 import { extname } from "path";
 
 import defaultRingtone from "file://ringtone.mp3?base64";
 
 import { buildOverlayHtml, clampScale, CLOSE_MS, overlaySize } from "./overlay";
+import { prepareStt, startSttServer, STT_PARTITION, sttLang, SttServer, sttSession } from "./stt";
 import { RELEASE_URL, runUpdate } from "./updater";
 
 export interface ShowOptions {
@@ -30,6 +32,9 @@ export interface ShowOptions {
     scale: number;
     theme: string;
     accent: string;
+    /** субтитры речи собеседника в панели разговора */
+    subtitles: boolean;
+    subtitleLang: string;
     /** на каком мониторе показывать, если панель стоит в углу */
     monitor: string;
     ringtonePath: string;
@@ -133,7 +138,9 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     releaseKeys();
     owner = e.sender;
 
-    const { width, height } = overlaySize(o.layout, o.scale / 100);
+    const subs = o.mode === "talk" && !!o.subtitles;
+    if (subs) sttSession();
+    const { width, height } = overlaySize(o.layout, o.scale / 100, subs);
     const area = pickDisplay(o.monitor).workArea;
     let pos = {
         x: o.position.endsWith("right") ? area.x + area.width - width : area.x,
@@ -165,7 +172,8 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
             contextIsolation: true,
             nodeIntegration: false,
             backgroundThrottling: false,
-            autoplayPolicy: "no-user-gesture-required"
+            autoplayPolicy: "no-user-gesture-required",
+            ...(subs ? { partition: STT_PARTITION } : {})
         }
     });
 
@@ -195,15 +203,33 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
         name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
         acceptKey: o.acceptKey, declineKey: o.declineKey,
         layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100),
-        theme: o.theme, accent: o.accent
+        theme: o.theme, accent: o.accent, subs
     });
-    await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+
+    // Для субтитров странице нужен «настоящий» адрес: с data:-страницы нельзя слушать звук и грузить модель
+    let server: SttServer | null = null;
+    if (subs) {
+        try {
+            server = await startSttServer(o.subtitleLang, randomBytes(16).toString("hex"), () => html);
+            const s = server;
+            if (w.isDestroyed()) return s.close();
+            w.on("closed", () => s.close());
+            // на случайном порту кэш модели не переиспользуется — чистим, чтобы он не копился
+            if (!s.stablePort) await sttSession().clearStorageData({ storages: ["indexdb"] }).catch(() => { });
+        } catch {
+            server = null;
+        }
+    }
+
+    await w.loadURL(server ? server.pageUrl : "data:text/html;charset=utf-8," + encodeURIComponent(html));
     if (w.isDestroyed()) return;
 
     w.showInactive();
     if (o.mode === "in") grabKey(o.acceptKey, "accept");
     // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
     if (o.mode !== "talk") grabKey(o.declineKey, "decline");
+
+    if (subs) startSubtitles(w, server, o.subtitleLang);
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
@@ -236,6 +262,24 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
 
     w.webContents.executeJavaScript(`cyberClose(${JSON.stringify(kind)})`).catch(() => { });
     setTimeout(() => destroy(w), CLOSE_MS + 60);
+}
+
+/** Докачивает распознавание при первом запуске и включает субтитры в окне. */
+function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string) {
+    const exec = (js: string, gesture = false) => {
+        if (!w.isDestroyed()) w.webContents.executeJavaScript(js, gesture).catch(() => { });
+    };
+    const status = (text: string, hold = 0) => exec(`cyberSubsStatus(${JSON.stringify(text)},${hold})`);
+
+    if (!server) return status("Субтитры не запустились: не удалось открыть локальный порт", 20000);
+
+    prepareStt(sttLang(lang), text => status(text))
+        .then(files => {
+            server.setFiles(files);
+            // userGesture = true: захват звука разрешён только «по действию пользователя»
+            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl })})`, true);
+        })
+        .catch(e => status("Не удалось скачать распознавание речи: " + String(e?.message ?? e), 20000));
 }
 
 function run(js: string) {

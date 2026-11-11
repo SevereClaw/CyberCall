@@ -18,6 +18,8 @@ export interface OverlayData {
     layout: "compact" | "big";
     /** масштаб, 1 = 100% */
     scale: number;
+    /** показывать строку субтитров и подключить распознавание речи (только для разговора) */
+    subs?: boolean;
     /** название готовой палитры или "custom" */
     theme?: string;
     /** свой акцентный цвет (#rrggbb) для палитры "custom" */
@@ -84,14 +86,18 @@ const BASE = {
     big: { width: 348, height: 498 }
 };
 
+/** высота строки субтитров под панелью */
+const SUBS_HEIGHT = { compact: 66, big: 104 };
+
 export function clampScale(scale: number) {
     return Math.min(2, Math.max(0.5, Number(scale) || 1));
 }
 
 /** Размер окна оверлея для выбранного вида и масштаба. */
-export function overlaySize(layout: "compact" | "big", scale: number) {
+export function overlaySize(layout: "compact" | "big", scale: number, subs = false) {
     const b = BASE[layout === "big" ? "big" : "compact"], s = clampScale(scale);
-    return { width: Math.ceil(b.width * s), height: Math.ceil(b.height * s) };
+    const extra = subs ? (layout === "big" ? SUBS_HEIGHT.big : SUBS_HEIGHT.compact) + 8 : 0;
+    return { width: Math.ceil(b.width * s), height: Math.ceil((b.height + extra) * s) };
 }
 /** Длительность анимации закрытия, мс */
 export const CLOSE_MS = 420;
@@ -101,6 +107,108 @@ function esc(s: string) {
         "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
     }[c]!));
 }
+
+/*
+ * Субтитры. Распознаём речь из общего звука компьютера, но только пока Discord сообщает,
+ * что собеседник говорит (плюс короткий хвост): так звуки игры почти не попадают в текст,
+ * а процессор в паузах не занят.
+ */
+const SUBS_SCRIPT = String.raw`
+const subsEl = document.getElementById("subs"), whoEl = subsEl.querySelector(".who"), txtEl = subsEl.querySelector(".txt");
+let subsTimer = 0;
+const subsHideIn = ms => { clearTimeout(subsTimer); subsTimer = setTimeout(() => subsEl.classList.remove("on"), ms); };
+window.cyberSubsStatus = (text, hold) => {
+  whoEl.textContent = ""; txtEl.textContent = text;
+  subsEl.className = "subs on status";
+  clearTimeout(subsTimer);
+  if (hold) subsHideIn(hold);
+};
+const caption = (text, final) => {
+  text = String(text || "").trim();
+  if (!text) return;
+  whoEl.textContent = document.getElementById("name").textContent;
+  txtEl.textContent = text[0].toUpperCase() + text.slice(1);
+  subsEl.className = "subs on";
+  subsHideIn(final ? 6000 : 10000);
+};
+
+let sttModel = null, sttRec = null, sttRate = 0, gateWasOpen = false;
+window.cyberSubsInit = async cfg => {
+  await new Promise((ok, fail) => {
+    const s = document.createElement("script");
+    s.src = cfg.engineUrl; s.onload = ok; s.onerror = () => fail(new Error("движок не загрузился"));
+    document.head.appendChild(s);
+  });
+  // если модель не поднялась, движок может молчать вечно — поэтому ждём не дольше двух минут
+  sttModel = await Promise.race([
+    Vosk.createModel(cfg.modelUrl, -1),
+    new Promise((_, fail) => setTimeout(() => fail(new Error("модель не загрузилась")), 120000))
+  ]);
+};
+window.cyberSubsFeed = (samples, rate) => {
+  if (!sttModel) return;
+  const now = Date.now();
+  if (speaking) lastVoice = now;
+  if (now - lastVoice > 800) {
+    // собеседник замолчал: дописываем тишину, чтобы распознаватель закончил фразу
+    if (gateWasOpen && sttRec) sttRec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
+    gateWasOpen = false;
+    return;
+  }
+  if (!sttRec || sttRate !== rate) {
+    if (sttRec) sttRec.remove();
+    sttRec = new sttModel.KaldiRecognizer(rate); sttRate = rate;
+    sttRec.on("partialresult", m => caption(m.result.partial, false));
+    sttRec.on("result", m => caption(m.result.text, true));
+  }
+  gateWasOpen = true;
+  sttRec.acceptWaveformFloat(samples, rate);
+};
+
+async function captureSystemAudio() {
+  let stream, firstError;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+  } catch (e) { firstError = e; }
+  if (!stream || !stream.getAudioTracks().length) {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { mandatory: { chromeMediaSource: "desktop" } },
+        video: { mandatory: { chromeMediaSource: "desktop" } }
+      });
+    } catch (e) { throw firstError || e; }
+  }
+  stream.getVideoTracks().forEach(t => t.stop());
+  if (!stream.getAudioTracks().length) throw new Error("система не отдала звук");
+  return stream;
+}
+
+window.cyberSubsStart = async cfg => {
+  try {
+    cyberSubsStatus("Запуск распознавания речи…");
+    await cyberSubsInit(cfg);
+    const stream = await Promise.race([
+      captureSystemAudio(),
+      new Promise((_, fail) => setTimeout(() => fail(new Error("система не ответила на запрос звука")), 15000))
+    ]);
+    const ctx = new AudioContext();
+    const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 2, 1), mute = ctx.createGain();
+    mute.gain.value = 0; // слушаем, но обратно в колонки ничего не отдаём
+    src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+    proc.onaudioprocess = e => {
+      const b = e.inputBuffer, l = b.getChannelData(0), mono = new Float32Array(l.length);
+      if (b.numberOfChannels > 1) { const r = b.getChannelData(1); for (let i = 0; i < l.length; i++) mono[i] = (l[i] + r[i]) / 2; }
+      else mono.set(l);
+      cyberSubsFeed(mono, ctx.sampleRate);
+    };
+    if (ctx.state === "suspended") await ctx.resume();
+    cyberSubsStatus("Субтитры включены", 2500);
+  } catch (e) {
+    cyberSubsStatus("Субтитры не запустились: " + (e && e.message || e), 20000);
+  }
+};
+`;
 
 export function buildOverlayHtml(d: OverlayData) {
     const out = d.mode === "out";
@@ -113,7 +221,9 @@ export function buildOverlayHtml(d: OverlayData) {
 
     return `<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data:; media-src blob: data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src https: data:; media-src blob: data:; style-src 'unsafe-inline'; ${d.subs
+            ? "script-src 'unsafe-inline' 'self' blob: 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' blob: data:"
+            : "script-src 'unsafe-inline'"}">
 <title>cybercall</title>
 <style>
 :root{
@@ -251,6 +361,19 @@ button:active{transform:translateY(1px)}
 @keyframes talk{0%,100%{transform:translateY(0) scale(1)}30%{transform:translateY(-3px) scale(1.035)}65%{transform:translateY(1px) scale(.99)}}
 @keyframes talkImg{0%,100%{transform:scale(1.02)}50%{transform:scale(1.09)}}
 
+/* ---------- субтитры ---------- */
+body.has-subs{flex-direction:column}
+.subs{flex:none;width:520px;height:${SUBS_HEIGHT.compact}px;margin-top:8px;padding:6px 12px 7px;overflow:hidden;
+  display:flex;flex-direction:column;justify-content:flex-end;
+  background:rgba(8,10,14,.84);border-left:3px solid var(--y);
+  font-size:15px;line-height:18px;font-weight:600;color:#f4f7fa;text-shadow:0 1px 2px #000;
+  opacity:0;transition:opacity .35s}
+.big .subs{width:320px;height:${SUBS_HEIGHT.big}px}
+.subs.on{opacity:1}
+.subs .who{color:var(--y);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-right:7px}
+.subs.status{font-size:12px;letter-spacing:.08em;font-weight:400;color:rgb(var(--c-rgb) / .9);border-left-color:var(--c)}
+body.out .subs{opacity:0;transition:opacity .12s}
+
 /* ---------- закрытие ---------- */
 body.out .panel{animation:close ${CLOSE_MS}ms cubic-bezier(.7,0,.8,.2) both}
 body.out .content{animation:contentOut .16s steps(3) both}
@@ -290,7 +413,7 @@ body.no .panel::before{background:var(--r)}
   43%{opacity:.9;transform:translate(3px,0);clip-path:inset(0 0 50% 0)}45%{opacity:0}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
-<body class="mode-${esc(d.mode)}${big ? " big" : ""}">
+<body class="mode-${esc(d.mode)}${big ? " big" : ""}${d.subs ? " has-subs" : ""}">
 <div class="wrap">
   <div class="panel">
     <div class="corner"></div>
@@ -319,13 +442,19 @@ body.no .panel::before{background:var(--r)}
     </div>
   </div>
 </div>
+${d.subs ? '<div class="subs" id="subs"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
 <script>
 // Клик по кнопке передаётся в главный процесс через заголовок окна.
 document.querySelectorAll("button").forEach(b =>
   b.addEventListener("click", () => { document.title = "cybercall:" + b.dataset.a + ":" + Date.now(); }));
 
 // Разговор: собеседник говорит / сменился говорящий (в групповом звонке)
-window.cyberSpeak = on => document.body.classList.toggle("speaking", !!on);
+let speaking = false, lastVoice = 0;
+window.cyberSpeak = on => {
+  speaking = !!on;
+  if (speaking) lastVoice = Date.now();
+  document.body.classList.toggle("speaking", speaking);
+};
 window.cyberUser = (name, sub, avatar) => {
   const n = document.getElementById("name");
   n.textContent = name; n.dataset.t = name;
@@ -362,6 +491,7 @@ panel.addEventListener("pointerup", endDrag);
 panel.addEventListener("pointercancel", endDrag);
 panel.addEventListener("lostpointercapture", endDrag);
 
+${d.subs ? SUBS_SCRIPT : ""}
 let audio = null;
 window.cyberClose = kind => {
   document.body.classList.add("out", kind === "accept" ? "ok" : kind === "decline" ? "no" : "x");

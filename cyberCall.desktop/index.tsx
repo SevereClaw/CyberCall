@@ -160,6 +160,19 @@ const settings = definePluginSettings({
         description: "Показывать панель разговора после ответа: аватарка оживает, когда собеседник говорит",
         default: true
     },
+    subtitles: {
+        type: OptionType.BOOLEAN,
+        description: "Субтитры: текст речи собеседника под панелью разговора. Распознаётся на компьютере, звук никуда не отправляется. При первом включении скачает около 45 МБ, во время звонка занимает заметно больше памяти",
+        default: false
+    },
+    subtitleLang: {
+        type: OptionType.SELECT,
+        description: "Язык субтитров (распознаётся один язык за раз)",
+        options: [
+            { label: "Русский", value: "ru", default: true },
+            { label: "English", value: "en" }
+        ]
+    },
     autoUpdate: {
         type: OptionType.BOOLEAN,
         description: "Автообновление: при запуске Discord и каждые 3 часа проверять новые сборки и ставить их самому",
@@ -234,6 +247,8 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         theme: s.theme as string,
         accent: s.accent as string,
         monitor: s.monitor as string,
+        subtitles: s.subtitles,
+        subtitleLang: s.subtitleLang as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
         ringtoneOutgoing: s.ringtoneOutgoing
