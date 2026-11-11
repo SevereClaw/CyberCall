@@ -17,6 +17,7 @@ export interface ShowOptions {
     name: string;
     sub: string;
     avatar: string;
+    mode: "in" | "out";
     acceptKey: string;
     declineKey: string;
     position: "top-left" | "top-right" | "bottom-left" | "bottom-right";
@@ -118,15 +119,18 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     });
 
     const html = buildOverlayHtml({
-        name: o.name, sub: o.sub, avatar: o.avatar,
+        name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode,
         acceptKey: o.acceptKey, declineKey: o.declineKey, right
     });
     await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
     if (w.isDestroyed()) return;
 
     w.showInactive();
-    grabKey(o.acceptKey, "accept");
+    if (o.mode === "in") grabKey(o.acceptKey, "accept");
     grabKey(o.declineKey, "decline");
+
+    // У исходящего свои гудки Discord, рингтон только для входящего
+    if (o.mode !== "in") return;
 
     // Свой файл из настроек, иначе встроенный рингтон
     let b64 = defaultRingtone, mime = "audio/mpeg";

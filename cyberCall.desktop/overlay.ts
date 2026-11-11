@@ -8,6 +8,8 @@ export interface OverlayData {
     name: string;
     sub: string;
     avatar: string;
+    /** in — звонят мне, out — звоню я */
+    mode: "in" | "out";
     acceptKey: string;
     declineKey: string;
     /** true — панель прижата к правому краю экрана */
@@ -26,8 +28,10 @@ function esc(s: string) {
 }
 
 export function buildOverlayHtml(d: OverlayData) {
+    const out = d.mode === "out";
     const name = esc(d.name);
-    const bars = Array.from({ length: 22 }, (_, i) => `<i style="animation-delay:-${(i * 137) % 900}ms"></i>`).join("");
+    const bars = Array.from({ length: out ? 16 : 22 }, (_, i) =>
+        `<i style="animation-delay:${out ? i * 90 - 1500 : -((i * 137) % 900)}ms"></i>`).join("");
 
     return `<!doctype html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -116,6 +120,20 @@ button:active{transform:translateY(1px)}
 .dec kbd{color:#ff8298}
 .acc{animation:pulse 1.4s ease-in-out infinite}
 
+/* ---------- исходящий вызов ---------- */
+.mode-out .label{color:var(--c)}
+.mode-out .label b{background:var(--y);box-shadow:0 0 8px var(--y)}
+.mode-out .corner{background:var(--c)}
+.mode-out .panel::before{background:linear-gradient(90deg,var(--c),var(--y))}
+.mode-out .wave{gap:4px}
+.mode-out .wave i{width:9px;height:4px;opacity:.18;animation:dial 1.5s linear infinite}
+.dots{margin-left:-8px}
+.dots i{font-style:normal;animation:dots 1.2s steps(1) infinite}
+.dots i:nth-child(2){animation-delay:.3s}
+.dots i:nth-child(3){animation-delay:.6s}
+@keyframes dial{0%{opacity:1;background:var(--y)}18%{opacity:.9;background:var(--c)}45%,100%{opacity:.18;background:var(--c)}}
+@keyframes dots{0%{opacity:0}35%,100%{opacity:1}}
+
 /* ---------- закрытие ---------- */
 body.out .panel{animation:close ${CLOSE_MS}ms cubic-bezier(.7,0,.8,.2) both}
 body.out .content{animation:contentOut .16s steps(3) both}
@@ -155,11 +173,11 @@ body.no .panel::before{background:var(--r)}
   43%{opacity:.9;transform:translate(3px,0);clip-path:inset(0 0 50% 0)}45%{opacity:0}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
-<body>
+<body class="${out ? "mode-out" : "mode-in"}">
 <div class="wrap">
   <div class="panel">
     <div class="corner"></div>
-    <div class="tag">HOLO // LINK</div>
+    <div class="tag">${out ? "HOLO // DIAL" : "HOLO // LINK"}</div>
     <div class="sweep"></div>
     <div class="content">
       <div class="ava">
@@ -170,13 +188,13 @@ body.no .panel::before{background:var(--r)}
         <div class="tint"></div><div class="lines"></div><div class="boot"></div>
       </div>
       <div class="info">
-        <div class="label"><b></b>ВХОДЯЩИЙ ВЫЗОВ</div>
+        <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
         <div class="name" data-t="${name}">${name}</div>
         <div class="sub">${esc(d.sub)}</div>
         <div class="wave">${bars}</div>
         <div class="btns">
-          <button class="acc" data-a="accept"><kbd>${esc(d.acceptKey)}</kbd>ПРИНЯТЬ</button>
-          <button class="dec" data-a="decline"><kbd>${esc(d.declineKey)}</kbd>ОТКЛОНИТЬ</button>
+          ${out ? "" : `<button class="acc" data-a="accept"><kbd>${esc(d.acceptKey)}</kbd>ПРИНЯТЬ</button>`}
+          <button class="dec" data-a="decline"><kbd>${esc(d.declineKey)}</kbd>${out ? "СБРОСИТЬ" : "ОТКЛОНИТЬ"}</button>
         </div>
       </div>
     </div>
