@@ -140,9 +140,14 @@ const settings = definePluginSettings({
         default: 70,
         stickToMarkers: false
     },
+    ringtoneOutgoing: {
+        type: OptionType.BOOLEAN,
+        description: "Играть свой рингтон и когда звонишь ты (вместо гудков Discord)",
+        default: true
+    },
     muteDiscordRing: {
         type: OptionType.BOOLEAN,
-        description: "Глушить стандартную мелодию звонка Discord, пока играет свой рингтон",
+        description: "Глушить стандартную мелодию звонка и гудки Discord, пока играет свой рингтон",
         default: true
     },
     showOutgoing: {
@@ -213,7 +218,8 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     shownMode = mode;
     shownSpeaker = null;
     const s = settings.store;
-    setRingMuted(mode === "in" && channelId !== TEST_ID && s.muteDiscordRing && s.ringtoneVolume > 0);
+    const ownRingtone = s.ringtoneVolume > 0 && (mode === "in" || (mode === "out" && s.ringtoneOutgoing));
+    setRingMuted(ownRingtone && channelId !== TEST_ID && s.muteDiscordRing);
     Native.showCall({
         ...info,
         mode,
@@ -229,7 +235,8 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         accent: s.accent as string,
         monitor: s.monitor as string,
         ringtonePath: s.ringtonePath,
-        ringtoneVolume: s.ringtoneVolume
+        ringtoneVolume: s.ringtoneVolume,
+        ringtoneOutgoing: s.ringtoneOutgoing
     });
 }
 

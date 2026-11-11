@@ -34,6 +34,8 @@ export interface ShowOptions {
     monitor: string;
     ringtonePath: string;
     ringtoneVolume: number;
+    /** играть рингтон и на исходящем вызове */
+    ringtoneOutgoing: boolean;
 }
 
 type Action = "accept" | "decline" | "dismiss";
@@ -203,8 +205,8 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
     // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
     if (o.mode !== "talk") grabKey(o.declineKey, "decline");
 
-    // У исходящего свои гудки Discord, рингтон только для входящего
-    if (o.mode !== "in") return;
+    // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
+    if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
 
     // Свой файл из настроек, иначе встроенный рингтон
     let b64 = defaultRingtone, mime = "audio/mpeg";
