@@ -45,11 +45,23 @@ jobs:
 
       - name: Package
         run: |
+          TAG="build-${{ github.run_number }}"
           mkdir -p pkg/CyberCall/dist
-          cp vencord/dist/patcher.js vencord/dist/preload.js vencord/dist/renderer.js vencord/dist/renderer.css pkg/CyberCall/dist/
-          cp vencord/dist/*.LEGAL.txt pkg/CyberCall/dist/ 2>/dev/null || true
+          cd vencord/dist
+          cp patcher.js preload.js renderer.js renderer.css ../../pkg/CyberCall/dist/
+          cp *.LEGAL.txt ../../pkg/CyberCall/dist/ 2>/dev/null || true
+          cd ../../pkg/CyberCall/dist
+          # version.json: по нему установленная копия понимает, что вышла новая сборка, и сверяет файлы
+          node -e '
+            const { createHash } = require("crypto"), { readFileSync, writeFileSync } = require("fs");
+            const files = {};
+            for (const f of ["patcher.js", "preload.js", "renderer.js", "renderer.css"])
+              files[f] = createHash("sha256").update(readFileSync(f)).digest("hex");
+            writeFileSync("version.json", JSON.stringify({ tag: process.argv[1], files }, null, 2));
+          ' "$TAG"
+          cd ../../..
           cp install.bat uninstall.bat LICENSE pkg/CyberCall/
-          cd pkg && zip -r ../CyberCall-win.zip CyberCall
+          (cd pkg && zip -r ../CyberCall-win.zip CyberCall)
 
       - name: Publish release
         env:
@@ -57,7 +69,9 @@ jobs:
         run: |
           VENCORD_SHA=$(git -C vencord rev-parse --short HEAD)
           TAG="build-${{ github.run_number }}"
+          D=pkg/CyberCall/dist
           gh release create "$TAG" CyberCall-win.zip \
+            "$D/patcher.js" "$D/preload.js" "$D/renderer.js" "$D/renderer.css" "$D/version.json" \
             --title "CyberCall $TAG" \
-            --notes "Сборка из ${GITHUB_SHA::7}, Vencord ${VENCORD_SHA}. Скачай CyberCall-win.zip, распакуй и запусти install.bat." \
+            --notes "Сборка из ${GITHUB_SHA::7}, Vencord ${VENCORD_SHA}. Для установки скачай CyberCall-win.zip, распакуй и запусти install.bat. Остальные файлы нужны автообновлению." \
             --latest

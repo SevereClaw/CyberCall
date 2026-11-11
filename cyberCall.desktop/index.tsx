@@ -2,8 +2,10 @@
  * CyberCall — входящий звонок Discord в киберпанк-стиле поверх игр и рабочего стола.
  */
 
+import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import { Button } from "@components/Button";
+import { relaunch } from "@utils/native";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
 import { CallStore, ChannelStore, IconUtils, RestAPI, UserStore } from "@webpack/common";
@@ -19,6 +21,11 @@ let shownChannelId: string | null = null;
 /** звонки, на которые уже ответили — чтобы оверлей не всплыл повторно, пока Discord обновляет состояние */
 const handled = new Set<string>();
 let testTimer: ReturnType<typeof setTimeout> | undefined;
+let updateTimer: ReturnType<typeof setInterval> | undefined;
+/** новая сборка уже скачана и ждёт перезапуска */
+let updateReady = false;
+
+const UPDATE_INTERVAL = 3 * 60 * 60 * 1000;
 
 const settings = definePluginSettings({
     acceptKey: {
@@ -53,11 +60,19 @@ const settings = definePluginSettings({
         default: 70,
         stickToMarkers: false
     },
+    autoUpdate: {
+        type: OptionType.BOOLEAN,
+        description: "Автообновление: при запуске Discord и каждые 3 часа проверять новые сборки и ставить их самому",
+        default: true
+    },
     test: {
         type: OptionType.COMPONENT,
         description: "Проверка",
         component: () => (
-            <Button onClick={() => showTest()}>Показать тестовый звонок</Button>
+            <div style={{ display: "flex", gap: 8 }}>
+                <Button onClick={() => showTest()}>Показать тестовый звонок</Button>
+                <Button variant="secondary" onClick={() => checkUpdate(true)}>Проверить обновления</Button>
+            </div>
         )
     }
 });
@@ -126,6 +141,43 @@ function showTest() {
     testTimer = setTimeout(() => shownChannelId === TEST_ID && hide("missed"), 15_000);
 }
 
+function notifyRestart(tag?: string) {
+    showNotification({
+        title: "CyberCall обновлён",
+        body: `Скачана новая сборка${tag ? " " + tag : ""}. Нажми сюда, чтобы перезапустить Discord, или она включится при следующем запуске.`,
+        permanent: true,
+        noPersist: true,
+        onClick: relaunch
+    });
+}
+
+async function checkUpdate(manual = false) {
+    if (!manual && !settings.store.autoUpdate) return;
+    if (updateReady) {
+        if (manual) notifyRestart();
+        return;
+    }
+
+    let result: Awaited<ReturnType<typeof Native.checkUpdate>>;
+    try {
+        result = await Native.checkUpdate();
+    } catch (e) {
+        result = { status: "error", error: String(e) };
+    }
+
+    if (result.status === "updated") {
+        updateReady = true;
+        notifyRestart(result.tag);
+    } else if (manual) {
+        const body = {
+            current: `Установлена последняя сборка${result.tag ? " (" + result.tag + ")" : ""}.`,
+            unsupported: "Эта копия собрана вручную, автообновление работает только после установки через install.bat.",
+            error: "Не получилось проверить обновления: " + (result.error ?? "неизвестная ошибка")
+        }[result.status];
+        showNotification({ title: "CyberCall", body, noPersist: true });
+    }
+}
+
 /** Сверяет оверлей с тем, что сейчас реально звонит в Discord. */
 function sync() {
     const meId = UserStore.getCurrentUser()?.id;
@@ -161,9 +213,12 @@ export default definePlugin({
 
     start() {
         scheduleSync();
+        setTimeout(() => checkUpdate(), 15_000);
+        updateTimer = setInterval(() => checkUpdate(), UPDATE_INTERVAL);
     },
 
     stop() {
+        clearInterval(updateTimer);
         handled.clear();
         if (shownChannelId) hide("missed");
     },

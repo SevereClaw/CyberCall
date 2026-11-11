@@ -4,13 +4,14 @@
  * Окно существует только пока идёт звонок, в остальное время плагин ничего не держит в памяти.
  */
 
-import { BrowserWindow, globalShortcut, IpcMainInvokeEvent, screen, WebContents } from "electron";
+import { BrowserWindow, globalShortcut, IpcMainInvokeEvent, net, screen, WebContents } from "electron";
 import { readFile, stat } from "fs/promises";
 import { extname } from "path";
 
 import defaultRingtone from "file://ringtone.mp3?base64";
 
 import { buildOverlayHtml, CLOSE_MS, OVERLAY_HEIGHT, OVERLAY_WIDTH } from "./overlay";
+import { RELEASE_URL, runUpdate } from "./updater";
 
 export interface ShowOptions {
     name: string;
@@ -155,4 +156,10 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
 
     w.webContents.executeJavaScript(`cyberClose(${JSON.stringify(kind)})`).catch(() => { });
     setTimeout(() => destroy(w), CLOSE_MS + 60);
+}
+
+/** Проверяет релизы на GitHub и, если вышла новая сборка, скачивает её. */
+export function checkUpdate(_: IpcMainInvokeEvent) {
+    // net.fetch ходит через сетевой стек Chromium, то есть учитывает системный прокси
+    return runUpdate(__dirname, RELEASE_URL, (url, init) => net.fetch(url, init));
 }
