@@ -9,7 +9,7 @@ import { copyToClipboard } from "@utils/clipboard";
 import { relaunch } from "@utils/native";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore, useEffect, useState } from "@webpack/common";
+import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore, useEffect, useState, MediaEngineStore } from "@webpack/common";
 
 import { THEMES } from "./overlay";
 import { installRingMuter, ringMuterReport, setRingMuted, uninstallRingMuter } from "./muteRing";
@@ -197,6 +197,11 @@ const settings = definePluginSettings({
         description: "Субтитры: текст речи собеседника под панелью разговора. Распознаётся на компьютере, звук никуда не отправляется. При первом звонке скачает около 45 МБ, во время звонка занимает около 400 МБ памяти",
         default: true
     },
+    ownCaptions: {
+        type: OptionType.BOOLEAN,
+        description: "Моё окно: под панелью разговора — моя аватарка и субтитры моей речи с микрофона (работает вместе с субтитрами)",
+        default: true
+    },
     subtitleLang: {
         type: OptionType.SELECT,
         description: "Язык субтитров (распознаётся один язык за раз)",
@@ -262,6 +267,31 @@ function describe(channelId: string) {
     };
 }
 
+const isSelfMuted = () => {
+    try {
+        return Boolean(MediaEngineStore.isSelfMute() || MediaEngineStore.isSelfDeaf());
+    } catch {
+        return false;
+    }
+};
+
+/** Моё имя, аватарка и микрофон, выбранный в Discord, — для моего окна с субтитрами. */
+function selfInfo() {
+    const me = UserStore.getCurrentUser();
+    let micLabel = "";
+    try {
+        const id = MediaEngineStore.getInputDeviceId();
+        // «default» — системный микрофон по умолчанию, его и так возьмёт окно
+        if (id && id !== "default") micLabel = String((MediaEngineStore.getInputDevices() as any)?.[id]?.name ?? "");
+    } catch { }
+    return {
+        selfName: (me as any)?.globalName || me?.username || "Я",
+        selfAvatar: me ? absolute(IconUtils.getUserAvatarURL(me, true, 128)) : FALLBACK_AVATAR,
+        selfMuted: isSelfMuted(),
+        micLabel
+    };
+}
+
 function show(channelId: string, mode: Mode, info: { name: string; sub: string; avatar: string; }) {
     shownChannelId = channelId;
     shownMode = mode;
@@ -285,6 +315,8 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         accent: s.accent as string,
         monitor: s.monitor as string,
         subtitles: s.captions,
+        ownCaptions: s.ownCaptions,
+        ...selfInfo(),
         subtitleLang: s.subtitleLang as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
@@ -459,12 +491,24 @@ let speakEvents = 0;
 function onSpeaking(e: any) {
     if (speakEvents++ === 0) log("первое событие речи от Discord: " + JSON.stringify(e).slice(0, 200));
     const id = e?.userId;
-    if (!id || id === UserStore.getCurrentUser()?.id) return;
+    if (!id) return;
 
     const on = Boolean(e.speakingFlags ?? e.speaking);
+    if (id === UserStore.getCurrentUser()?.id) {
+        if (shownMode === "talk" && shownChannelId) Native.setSelfSpeaking(on);
+        return;
+    }
+
     if (on === speakers.has(id)) return;
     if (on) speakers.add(id); else speakers.delete(id);
     pushSpeaking();
+}
+
+function onSelfMute() {
+    // состояние в Discord меняется чуть позже самого события
+    setTimeout(() => {
+        if (shownMode === "talk" && shownChannelId) Native.setSelfMuted(isSelfMuted());
+    }, 80);
 }
 
 const scheduleSync = () => { setTimeout(sync, 60); };
@@ -481,6 +525,8 @@ export default definePlugin({
         CALL_DELETE: scheduleSync,
         VOICE_CHANNEL_SELECT: scheduleSync,
         SPEAKING: onSpeaking,
+        AUDIO_TOGGLE_SELF_MUTE: onSelfMute,
+        AUDIO_TOGGLE_SELF_DEAF: onSelfMute,
         CONNECTION_OPEN: scheduleSync
     },
 

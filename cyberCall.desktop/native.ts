@@ -35,6 +35,13 @@ export interface ShowOptions {
     /** субтитры речи собеседника в панели разговора */
     subtitles: boolean;
     subtitleLang: string;
+    /** моё окно с моими субтитрами */
+    ownCaptions: boolean;
+    selfName: string;
+    selfAvatar: string;
+    selfMuted: boolean;
+    /** название микрофона, выбранного в Discord */
+    micLabel: string;
     /** на каком мониторе показывать, если панель стоит в углу */
     monitor: string;
     ringtonePath: string;
@@ -155,7 +162,8 @@ async function openCall(o: ShowOptions) {
 
     const subs = o.mode === "talk" && !!o.subtitles;
     if (subs) sttSession();
-    const { width, height } = overlaySize(o.layout, o.scale / 100, subs);
+    const mine = subs && !!o.ownCaptions;
+    const { width, height } = overlaySize(o.layout, o.scale / 100, subs, mine);
     const area = pickDisplay(o.monitor).workArea;
     let pos = {
         x: o.position.endsWith("right") ? area.x + area.width - width : area.x,
@@ -209,7 +217,7 @@ async function openCall(o: ShowOptions) {
         ev.preventDefault();
         const m = /^cybercall:(accept|decline|dismiss|dragstart|dragend):/.exec(title);
         if (title.startsWith("cybercall:log:")) {
-            try { log("панель: " + decodeURIComponent(title.slice(14))); } catch { }
+            try { log("панель: " + decodeURIComponent(title.slice(14).replace(/:\d+$/, ""))); } catch { }
             return;
         }
         if (!m) return;
@@ -222,7 +230,8 @@ async function openCall(o: ShowOptions) {
         name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
         acceptKey: o.acceptKey, declineKey: o.declineKey,
         layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100),
-        theme: o.theme, accent: o.accent, subs
+        theme: o.theme, accent: o.accent, subs,
+        me: mine ? { name: o.selfName, avatar: o.selfAvatar } : null
     });
 
     // Для субтитров странице нужен «настоящий» адрес: с data:-страницы нельзя слушать звук и грузить модель
@@ -263,7 +272,10 @@ async function openCall(o: ShowOptions) {
     // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
     if (o.mode !== "talk") grabKey(o.declineKey, "decline");
 
-    if (subs) startSubtitles(w, server, o.subtitleLang);
+    if (subs) {
+        if (mine && o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
+        startSubtitles(w, server, o.subtitleLang, mine ? o.micLabel : "");
+    }
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
@@ -299,7 +311,7 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
 }
 
 /** Докачивает распознавание при первом запуске и включает субтитры в окне. */
-function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string) {
+function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, micLabel: string) {
     const exec = (js: string, gesture = false) => {
         if (!w.isDestroyed()) w.webContents.executeJavaScript(js, gesture).catch(() => { });
     };
@@ -313,7 +325,7 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
             log("субтитры: файлы готовы, запускаю распознавание (" + sttLang(lang) + ")");
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
-            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl })})`, true);
+            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, micLabel })})`, true);
         })
         .catch(e => {
             const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);
@@ -329,6 +341,16 @@ function run(js: string) {
 /** Собеседник начал или перестал говорить. */
 export function setSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
     run(`cyberSpeak(${speaking ? "true" : "false"})`);
+}
+
+/** Я начал или перестал говорить (для моего окна с субтитрами). */
+export function setSelfSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
+    run(`window.cyberSelfSpeak&&cyberSelfSpeak(${speaking ? "true" : "false"})`);
+}
+
+/** Я выключил или включил микрофон. */
+export function setSelfMuted(_: IpcMainInvokeEvent, muted: boolean) {
+    run(`window.cyberSelfMuted&&cyberSelfMuted(${muted ? "true" : "false"})`);
 }
 
 /** В групповом звонке сменился говорящий. */

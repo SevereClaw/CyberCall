@@ -20,6 +20,8 @@ export interface OverlayData {
     scale: number;
     /** показывать строку субтитров и подключить распознавание речи (только для разговора) */
     subs?: boolean;
+    /** моё окно с моими субтитрами (только вместе с subs): моё имя и аватарка */
+    me?: { name: string; avatar: string; } | null;
     /** название готовой палитры или "custom" */
     theme?: string;
     /** свой акцентный цвет (#rrggbb) для палитры "custom" */
@@ -89,14 +91,18 @@ const BASE = {
 /** высота строки субтитров под панелью */
 const SUBS_HEIGHT = { compact: 66, big: 104 };
 
+/** высота моего окна с моими субтитрами */
+const MINE_HEIGHT = { compact: 60, big: 96 };
+
 export function clampScale(scale: number) {
     return Math.min(2, Math.max(0.5, Number(scale) || 1));
 }
 
 /** Размер окна оверлея для выбранного вида и масштаба. */
-export function overlaySize(layout: "compact" | "big", scale: number, subs = false) {
+export function overlaySize(layout: "compact" | "big", scale: number, subs = false, mine = false) {
     const b = BASE[layout === "big" ? "big" : "compact"], s = clampScale(scale);
-    const extra = subs ? (layout === "big" ? SUBS_HEIGHT.big : SUBS_HEIGHT.compact) + 8 : 0;
+    const extra = (subs ? (layout === "big" ? SUBS_HEIGHT.big : SUBS_HEIGHT.compact) + 8 : 0)
+        + (subs && mine ? (layout === "big" ? MINE_HEIGHT.big : MINE_HEIGHT.compact) + 8 : 0);
     return { width: Math.ceil(b.width * s), height: Math.ceil((b.height + extra) * s) };
 }
 /** Длительность анимации закрытия, мс */
@@ -115,8 +121,12 @@ function esc(s: string) {
  */
 const SUBS_SCRIPT = String.raw`
 const subsEl = document.getElementById("subs"), whoEl = subsEl.querySelector(".who"), txtEl = subsEl.querySelector(".txt");
-let subsTimer = 0;
+const mineEl = document.getElementById("mine"), mineTxt = document.getElementById("mineTxt");
+let subsTimer = 0, mineTimer = 0;
 const subsHideIn = ms => { clearTimeout(subsTimer); subsTimer = setTimeout(() => subsEl.classList.remove("on"), ms); };
+const sendLog = text => { document.title = "cybercall:log:" + encodeURIComponent(text) + ":" + Date.now(); };
+const nice = text => { text = String(text || "").trim(); return text ? text[0].toUpperCase() + text.slice(1) : ""; };
+
 window.cyberSubsStatus = (text, hold) => {
   whoEl.textContent = ""; txtEl.textContent = text;
   subsEl.className = "subs on status";
@@ -124,25 +134,38 @@ window.cyberSubsStatus = (text, hold) => {
   if (hold) subsHideIn(hold);
 };
 const caption = (text, final) => {
-  text = String(text || "").trim();
+  text = nice(text);
   if (!text) return;
   whoEl.textContent = document.getElementById("name").textContent;
-  txtEl.textContent = text[0].toUpperCase() + text.slice(1);
+  txtEl.textContent = text;
   subsEl.className = "subs on";
   subsHideIn(final ? 6000 : 10000);
 };
+// мои слова — в моём окне под панелью
+const mineCaption = (text, final) => {
+  text = nice(text);
+  if (!text || !mineEl) return;
+  mineTxt.textContent = text;
+  mineTxt.classList.remove("dim");
+  clearTimeout(mineTimer);
+  mineTimer = setTimeout(() => { mineTxt.textContent = ""; }, final ? 6000 : 10000);
+};
+const mineStatus = text => { if (mineEl) { mineTxt.textContent = text; mineTxt.classList.add("dim"); clearTimeout(mineTimer); } };
 
-let sttModel = null, sttRec = null, sttRate = 0, gateWasOpen = false, lastSound = 0;
-// счётчики для журнала: по ним видно, где обрывается цепочка «звук → распознавание → текст»
-const sttStats = { blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0 };
-let sttLogged = "", sttLogs = 0;
-setInterval(() => {
-  const line = "звук: блоков=" + sttStats.blocks + " распознавалось=" + sttStats.fed + " пик=" + sttStats.peak.toFixed(3)
-    + " речь по Discord=" + spokeEver + " текст: черновых=" + sttStats.partials + " готовых=" + sttStats.finals;
-  if (!sttStats.blocks || line === sttLogged || sttLogs >= 14) return;
-  sttLogged = line; sttLogs++;
-  document.title = "cybercall:log:" + encodeURIComponent(line);
-}, 10000);
+// Сигналы «я говорю» и «я выключил микрофон» от Discord
+let selfSpeaking = false, selfSpokeEver = false, selfMuted = false;
+window.cyberSelfSpeak = on => {
+  selfSpeaking = !!on;
+  if (selfSpeaking) selfSpokeEver = true;
+  if (mineEl) mineEl.classList.toggle("speaking", selfSpeaking);
+};
+window.cyberSelfMuted = on => {
+  selfMuted = !!on;
+  if (mineEl) mineEl.classList.toggle("muted", selfMuted);
+  if (selfMuted) mineStatus("микрофон выключен"); else if (mineTxt && mineTxt.classList.contains("dim")) mineTxt.textContent = "";
+};
+
+let sttModel = null;
 window.cyberSubsInit = async cfg => {
   await new Promise((ok, fail) => {
     const s = document.createElement("script");
@@ -155,35 +178,59 @@ window.cyberSubsInit = async cfg => {
     new Promise((_, fail) => setTimeout(() => fail(new Error("модель не загрузилась")), 120000))
   ]);
 };
-window.cyberSubsFeed = (samples, rate) => {
-  if (!sttModel) return;
-  const now = Date.now();
-  if (speaking) lastVoice = now;
-  let sum = 0;
-  for (let i = 0; i < samples.length; i += 4) sum += samples[i] * samples[i];
-  const level = Math.sqrt(sum / (samples.length / 4));
-  sttStats.blocks++;
-  if (level > sttStats.peak) sttStats.peak = level;
-  if (level > 0.008) lastSound = now;
-  // Основной сигнал — «собеседник говорит» от Discord. Если Discord его ни разу не прислал,
-  // ориентируемся на громкость: распознаём, пока в звуке компьютера что-то слышно.
-  const open = now - lastVoice <= 800 || (!spokeEver && now - lastSound <= 800);
-  if (!open) {
-    // собеседник замолчал: дописываем тишину, чтобы распознаватель закончил фразу
-    if (gateWasOpen && sttRec) sttRec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
-    gateWasOpen = false;
-    return;
-  }
-  if (!sttRec || sttRate !== rate) {
-    if (sttRec) sttRec.remove();
-    sttRec = new sttModel.KaldiRecognizer(rate); sttRate = rate;
-    sttRec.on("partialresult", m => { if (m.result.partial) sttStats.partials++; caption(m.result.partial, false); });
-    sttRec.on("result", m => { if (m.result.text) sttStats.finals++; caption(m.result.text, true); });
-  }
-  gateWasOpen = true;
-  sttStats.fed++;
-  sttRec.acceptWaveformFloat(samples, rate);
-};
+
+/*
+ * Один слушатель = один поток звука со своим распознавателем.
+ * signal() возвращает { on, ever, blocked }: говорит ли человек по данным Discord, приходил ли
+ * этот сигнал хоть раз, и запрещено ли слушать (микрофон выключен). Если Discord сигнал ни разу
+ * не прислал, ориентируемся на громкость.
+ */
+function makeListener(signal, show, stats) {
+  let rec = null, recRate = 0, wasOpen = false, lastFlag = 0, lastSound = 0;
+  return (samples, rate) => {
+    if (!sttModel) return;
+    const now = Date.now(), sig = signal();
+    if (sig.on) lastFlag = now;
+    let sum = 0;
+    for (let i = 0; i < samples.length; i += 4) sum += samples[i] * samples[i];
+    const level = Math.sqrt(sum / (samples.length / 4));
+    stats.blocks++;
+    if (level > stats.peak) stats.peak = level;
+    if (level > 0.008) lastSound = now;
+    const open = !sig.blocked && (now - lastFlag <= 800 || (!sig.ever && now - lastSound <= 800));
+    if (!open) {
+      // человек замолчал: дописываем тишину, чтобы распознаватель закончил фразу
+      if (wasOpen && rec) rec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
+      wasOpen = false;
+      return;
+    }
+    if (!rec || recRate !== rate) {
+      if (rec) rec.remove();
+      rec = new sttModel.KaldiRecognizer(rate); recRate = rate;
+      rec.on("partialresult", m => { if (m.result.partial) stats.partials++; show(m.result.partial, false); });
+      rec.on("result", m => { if (m.result.text) stats.finals++; show(m.result.text, true); });
+    }
+    wasOpen = true;
+    stats.fed++;
+    rec.acceptWaveformFloat(samples, rate);
+  };
+}
+
+// счётчики для журнала: по ним видно, где обрывается цепочка «звук → распознавание → текст»
+const newStats = () => ({ blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0 });
+const sttStats = newStats(), mineStats = newStats();
+window.cyberSubsFeed = makeListener(() => ({ on: speaking, ever: spokeEver, blocked: false }), caption, sttStats);
+window.cyberMineFeed = makeListener(() => ({ on: selfSpeaking, ever: selfSpokeEver, blocked: selfMuted }), mineCaption, mineStats);
+
+let sttLogged = "", sttLogs = 0;
+const statLine = (title, st, ever) => title + ": блоков=" + st.blocks + " распознавалось=" + st.fed + " пик=" + st.peak.toFixed(3)
+  + " речь по Discord=" + ever + " текст: черновых=" + st.partials + " готовых=" + st.finals;
+setInterval(() => {
+  const line = statLine("звук", sttStats, spokeEver) + (mineStats.blocks ? " | " + statLine("микрофон", mineStats, selfSpokeEver) : "");
+  if (!sttStats.blocks || line === sttLogged || sttLogs >= 14) return;
+  sttLogged = line; sttLogs++;
+  sendLog(line);
+}, 10000);
 
 async function captureSystemAudio() {
   let stream, firstError;
@@ -204,31 +251,69 @@ async function captureSystemAudio() {
   return stream;
 }
 
+// Микрофон: берём тот же, что выбран в Discord (ищем по названию), иначе системный по умолчанию
+async function captureMic(micLabel) {
+  const opts = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  let stream = await navigator.mediaDevices.getUserMedia({ audio: opts });
+  const current = stream.getAudioTracks()[0].label;
+  if (micLabel && !current.includes(micLabel)) {
+    const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput" && d.label.includes(micLabel));
+    const wanted = devices.find(d => d.deviceId !== "default" && d.deviceId !== "communications") || devices[0];
+    if (wanted) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { ...opts, deviceId: { exact: wanted.deviceId } } });
+    }
+  }
+  return stream;
+}
+
+function pipe(ctx, stream, feed) {
+  const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 2, 1), mute = ctx.createGain();
+  mute.gain.value = 0; // слушаем, но обратно в колонки ничего не отдаём
+  src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+  proc.onaudioprocess = e => {
+    const b = e.inputBuffer, l = b.getChannelData(0), mono = new Float32Array(l.length);
+    if (b.numberOfChannels > 1) { const r = b.getChannelData(1); for (let i = 0; i < l.length; i++) mono[i] = (l[i] + r[i]) / 2; }
+    else mono.set(l);
+    feed(mono, ctx.sampleRate);
+  };
+}
+
 window.cyberSubsStart = async cfg => {
+  let ctx;
   try {
     cyberSubsStatus("Запуск распознавания речи…");
+    if (!selfMuted) mineStatus("запуск…");
     await cyberSubsInit(cfg);
     const stream = await Promise.race([
       captureSystemAudio(),
       new Promise((_, fail) => setTimeout(() => fail(new Error("система не ответила на запрос звука")), 15000))
     ]);
-    const ctx = new AudioContext();
-    const src = ctx.createMediaStreamSource(stream), proc = ctx.createScriptProcessor(4096, 2, 1), mute = ctx.createGain();
-    mute.gain.value = 0; // слушаем, но обратно в колонки ничего не отдаём
-    src.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
-    proc.onaudioprocess = e => {
-      const b = e.inputBuffer, l = b.getChannelData(0), mono = new Float32Array(l.length);
-      if (b.numberOfChannels > 1) { const r = b.getChannelData(1); for (let i = 0; i < l.length; i++) mono[i] = (l[i] + r[i]) / 2; }
-      else mono.set(l);
-      cyberSubsFeed(mono, ctx.sampleRate);
-    };
+    ctx = new AudioContext();
+    pipe(ctx, stream, cyberSubsFeed);
     if (ctx.state === "suspended") await ctx.resume();
     cyberSubsStatus("Субтитры включены", 2500);
-    document.title = "cybercall:log:" + encodeURIComponent("субтитры включены, частота " + ctx.sampleRate);
+    sendLog("субтитры включены, частота " + ctx.sampleRate);
   } catch (e) {
     const text = "Субтитры не запустились: " + (e && e.message || e);
     cyberSubsStatus(text, 20000);
-    document.title = "cybercall:log:" + encodeURIComponent(text + (e && e.name ? " [" + e.name + "]" : ""));
+    sendLog(text + (e && e.name ? " [" + e.name + "]" : ""));
+  }
+
+  if (!mineEl || !sttModel) return;
+  try {
+    const mic = await Promise.race([
+      captureMic(cfg.micLabel),
+      new Promise((_, fail) => setTimeout(() => fail(new Error("микрофон не ответил")), 15000))
+    ]);
+    ctx = ctx || new AudioContext();
+    pipe(ctx, mic, cyberMineFeed);
+    if (ctx.state === "suspended") await ctx.resume();
+    if (!selfMuted) mineStatus("");
+    sendLog("мои субтитры включены, микрофон: " + mic.getAudioTracks()[0].label);
+  } catch (e) {
+    mineStatus("микрофон недоступен");
+    sendLog("мои субтитры не запустились: " + (e && e.message || e) + (e && e.name ? " [" + e.name + "]" : ""));
   }
 };
 `;
@@ -397,6 +482,24 @@ body.has-subs{flex-direction:column}
 .subs.status{font-size:12px;letter-spacing:.08em;font-weight:400;color:rgb(var(--c-rgb) / .9);border-left-color:var(--c)}
 body.out .subs{opacity:0;transition:opacity .12s}
 
+/* ---------- моё окно ---------- */
+.mine{flex:none;width:520px;height:${MINE_HEIGHT.compact}px;margin-top:8px;display:flex;gap:11px;padding:8px 12px 8px 9px;overflow:hidden;
+  background:rgba(8,10,14,.9);border-left:3px solid var(--c);
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%);
+  animation:content .45s ease-out .5s both}
+.big .mine{width:320px;height:${MINE_HEIGHT.big}px}
+.mava{position:relative;flex:none;width:44px;height:44px;background:#05070a;border:1px solid rgb(var(--c-rgb) / .7);transition:border-color .15s}
+.mava img{width:100%;height:100%;object-fit:cover;display:block}
+.mine.speaking .mava{border:2px solid var(--y);animation:talk .62s ease-in-out infinite}
+.mine.muted .mava{filter:grayscale(1) brightness(.6)}
+.mbody{flex:1;min-width:0;display:flex;flex-direction:column}
+.mwho{font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mine.speaking .mwho{color:var(--y)}
+.mline{flex:1;min-height:0;margin-top:2px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;
+  font-size:14px;line-height:17px;font-weight:600;color:#f4f7fa;text-shadow:0 1px 2px #000}
+.mline.dim{font-size:11px;font-weight:400;letter-spacing:.08em;color:rgb(var(--c-rgb) / .7)}
+body.out .mine{opacity:0;transition:opacity .12s}
+
 /* ---------- закрытие ---------- */
 body.out .panel{animation:close ${CLOSE_MS}ms cubic-bezier(.7,0,.8,.2) both}
 body.out .content{animation:contentOut .16s steps(3) both}
@@ -466,6 +569,7 @@ body.no .panel::before{background:var(--r)}
   </div>
 </div>
 ${d.subs ? '<div class="subs" id="subs"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
+${d.subs && d.me ? `<div class="mine" id="mine"><div class="mava"><img src="${esc(d.me.avatar)}" alt=""></div><div class="mbody"><div class="mwho">${esc(d.me.name)} · Я</div><div class="mline"><div id="mineTxt"></div></div></div></div>` : ""}
 <script>
 // Клик по кнопке передаётся в главный процесс через заголовок окна.
 document.querySelectorAll("button").forEach(b =>
