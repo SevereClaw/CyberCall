@@ -64,7 +64,8 @@ async function copyJournal() {
     const head = [
         "CyberCall " + await Native.getVersion().catch(() => "?"),
         `настройки: субтитры=${s.captions}/${s.subtitleLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
-        ringMuterReport()
+        ringMuterReport(),
+        `события речи от Discord: ${speakEvents}, сейчас говорят: ${speakers.size}`
     ];
     await copyToClipboard([...head, ...journal].join("\n"));
     showNotification({ title: "CyberCall", body: "Журнал скопирован. Вставь его в чат.", noPersist: true });
@@ -452,7 +453,11 @@ function pushSpeaking() {
     Native.setSpeaking(speakers.size > 0);
 }
 
+/** сколько событий «говорит» пришло от Discord — для журнала */
+let speakEvents = 0;
+
 function onSpeaking(e: any) {
+    if (speakEvents++ === 0) log("первое событие речи от Discord: " + JSON.stringify(e).slice(0, 200));
     const id = e?.userId;
     if (!id || id === UserStore.getCurrentUser()?.id) return;
 

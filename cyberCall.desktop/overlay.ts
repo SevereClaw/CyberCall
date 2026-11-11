@@ -132,7 +132,17 @@ const caption = (text, final) => {
   subsHideIn(final ? 6000 : 10000);
 };
 
-let sttModel = null, sttRec = null, sttRate = 0, gateWasOpen = false;
+let sttModel = null, sttRec = null, sttRate = 0, gateWasOpen = false, lastSound = 0;
+// счётчики для журнала: по ним видно, где обрывается цепочка «звук → распознавание → текст»
+const sttStats = { blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0 };
+let sttLogged = "", sttLogs = 0;
+setInterval(() => {
+  const line = "звук: блоков=" + sttStats.blocks + " распознавалось=" + sttStats.fed + " пик=" + sttStats.peak.toFixed(3)
+    + " речь по Discord=" + spokeEver + " текст: черновых=" + sttStats.partials + " готовых=" + sttStats.finals;
+  if (!sttStats.blocks || line === sttLogged || sttLogs >= 14) return;
+  sttLogged = line; sttLogs++;
+  document.title = "cybercall:log:" + encodeURIComponent(line);
+}, 10000);
 window.cyberSubsInit = async cfg => {
   await new Promise((ok, fail) => {
     const s = document.createElement("script");
@@ -149,7 +159,16 @@ window.cyberSubsFeed = (samples, rate) => {
   if (!sttModel) return;
   const now = Date.now();
   if (speaking) lastVoice = now;
-  if (now - lastVoice > 800) {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 4) sum += samples[i] * samples[i];
+  const level = Math.sqrt(sum / (samples.length / 4));
+  sttStats.blocks++;
+  if (level > sttStats.peak) sttStats.peak = level;
+  if (level > 0.008) lastSound = now;
+  // Основной сигнал — «собеседник говорит» от Discord. Если Discord его ни разу не прислал,
+  // ориентируемся на громкость: распознаём, пока в звуке компьютера что-то слышно.
+  const open = now - lastVoice <= 800 || (!spokeEver && now - lastSound <= 800);
+  if (!open) {
     // собеседник замолчал: дописываем тишину, чтобы распознаватель закончил фразу
     if (gateWasOpen && sttRec) sttRec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
     gateWasOpen = false;
@@ -158,10 +177,11 @@ window.cyberSubsFeed = (samples, rate) => {
   if (!sttRec || sttRate !== rate) {
     if (sttRec) sttRec.remove();
     sttRec = new sttModel.KaldiRecognizer(rate); sttRate = rate;
-    sttRec.on("partialresult", m => caption(m.result.partial, false));
-    sttRec.on("result", m => caption(m.result.text, true));
+    sttRec.on("partialresult", m => { if (m.result.partial) sttStats.partials++; caption(m.result.partial, false); });
+    sttRec.on("result", m => { if (m.result.text) sttStats.finals++; caption(m.result.text, true); });
   }
   gateWasOpen = true;
+  sttStats.fed++;
   sttRec.acceptWaveformFloat(samples, rate);
 };
 
@@ -452,10 +472,10 @@ document.querySelectorAll("button").forEach(b =>
   b.addEventListener("click", () => { document.title = "cybercall:" + b.dataset.a + ":" + Date.now(); }));
 
 // Разговор: собеседник говорит / сменился говорящий (в групповом звонке)
-let speaking = false, lastVoice = 0;
+let speaking = false, lastVoice = 0, spokeEver = false;
 window.cyberSpeak = on => {
   speaking = !!on;
-  if (speaking) lastVoice = Date.now();
+  if (speaking) { lastVoice = Date.now(); spokeEver = true; }
   document.body.classList.toggle("speaking", speaking);
 };
 window.cyberUser = (name, sub, avatar) => {
