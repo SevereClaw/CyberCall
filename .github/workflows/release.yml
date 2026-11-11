@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["README.md", "docs/**"]
+  schedule:
+    # раз в неделю пересобираем со свежим Vencord, чтобы не ломалось после обновлений Discord
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Clone Vencord
+        run: git clone --depth 1 https://github.com/Vendicated/Vencord.git vencord
+
+      - name: Add plugin
+        run: |
+          mkdir -p vencord/src/userplugins
+          cp -r cyberCall.desktop vencord/src/userplugins/
+
+      - name: Build
+        working-directory: vencord
+        run: |
+          npm install -g "$(node -p "require('./package.json').packageManager")"
+          pnpm install --frozen-lockfile
+          pnpm build --disable-updater
+          grep -q "CyberCall" dist/patcher.js
+          grep -q "CyberCall" dist/renderer.js
+
+      - name: Package
+        run: |
+          mkdir -p pkg/CyberCall/dist
+          cp vencord/dist/patcher.js vencord/dist/preload.js vencord/dist/renderer.js vencord/dist/renderer.css pkg/CyberCall/dist/
+          cp vencord/dist/*.LEGAL.txt pkg/CyberCall/dist/ 2>/dev/null || true
+          cp install.bat uninstall.bat LICENSE pkg/CyberCall/
+          cd pkg && zip -r ../CyberCall-win.zip CyberCall
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VENCORD_SHA=$(git -C vencord rev-parse --short HEAD)
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" CyberCall-win.zip \
+            --title "CyberCall $TAG" \
+            --notes "Сборка из ${GITHUB_SHA::7}, Vencord ${VENCORD_SHA}. Скачай CyberCall-win.zip, распакуй и запусти install.bat." \
+            --latest
