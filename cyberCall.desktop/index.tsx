@@ -16,7 +16,7 @@ const VoiceActions = findByPropsLazy("selectVoiceChannel", "selectChannel");
 const TEST_ID = "cybercall-test";
 const FALLBACK_AVATAR = "https://cdn.discordapp.com/embed/avatars/0.png";
 
-type Mode = "in" | "out";
+type Mode = "in" | "out" | "talk";
 
 /** id канала, звонок из которого сейчас показан в оверлее */
 let shownChannelId: string | null = null;
@@ -24,6 +24,15 @@ let shownChannelId: string | null = null;
 let shownMode: Mode = "in";
 /** каналы, где звонили мне: после ответа там не показываем панель исходящего */
 const wasIncoming = new Set<string>();
+/** разговоры, у которых панель скрыли кнопкой «Скрыть» */
+const dismissedTalk = new Set<string>();
+/** когда начался разговор в канале — для таймера */
+const talkStart = new Map<string, number>();
+/** кто сейчас говорит (кроме меня) */
+const speakers = new Set<string>();
+let shownSpeaker: string | null = null;
+let lastHideAt = 0;
+let speakTestTimer: ReturnType<typeof setInterval> | undefined;
 /** звонки, на которые уже ответили — чтобы оверлей не всплыл повторно, пока Discord обновляет состояние */
 const handled = new Set<string>();
 let testTimer: ReturnType<typeof setTimeout> | undefined;
@@ -71,6 +80,11 @@ const settings = definePluginSettings({
         description: "Показывать панель исходящего вызова, когда звонишь ты (сброс — клавишей «Отклонить»)",
         default: true
     },
+    showInCall: {
+        type: OptionType.BOOLEAN,
+        description: "Показывать панель разговора после ответа: аватарка оживает, когда собеседник говорит",
+        default: true
+    },
     autoUpdate: {
         type: OptionType.BOOLEAN,
         description: "Автообновление: при запуске Discord и каждые 3 часа проверять новые сборки и ставить их самому",
@@ -80,9 +94,10 @@ const settings = definePluginSettings({
         type: OptionType.COMPONENT,
         description: "Проверка",
         component: () => (
-            <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <Button onClick={() => showTest("in")}>Тест входящего</Button>
                 <Button onClick={() => showTest("out")}>Тест исходящего</Button>
+                <Button onClick={() => showTest("talk")}>Тест разговора</Button>
                 <Button variant="secondary" onClick={() => checkUpdate(true)}>Проверить обновления</Button>
             </div>
         )
@@ -107,7 +122,7 @@ function describe(channelId: string) {
         return {
             name: (u as any).globalName || u.username,
             sub: "@" + u.username,
-            avatar: absolute(IconUtils.getUserAvatarURL(u, false, 256))
+            avatar: absolute(IconUtils.getUserAvatarURL(u, true, 256))
         };
     }
 
@@ -118,7 +133,7 @@ function describe(channelId: string) {
         sub: users.length ? `Группа · ${users.length + 1} участников` : "Discord",
         avatar: absolute(
             (channel && IconUtils.getChannelIconURL({ id: channel.id, icon: (channel as any).icon, size: 256 }))
-            || (users[0] && IconUtils.getUserAvatarURL(users[0], false, 256))
+            || (users[0] && IconUtils.getUserAvatarURL(users[0], true, 256))
         )
     };
 }
@@ -126,10 +141,12 @@ function describe(channelId: string) {
 function show(channelId: string, mode: Mode, info: { name: string; sub: string; avatar: string; }) {
     shownChannelId = channelId;
     shownMode = mode;
+    shownSpeaker = null;
     const s = settings.store;
     Native.showCall({
         ...info,
         mode,
+        startedAt: talkStart.get(channelId),
         acceptKey: s.acceptKey,
         declineKey: s.declineKey,
         position: s.position as any,
@@ -140,7 +157,10 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
 
 function hide(kind: "accept" | "decline" | "missed") {
     shownChannelId = null;
+    shownSpeaker = null;
+    lastHideAt = Date.now();
     clearTimeout(testTimer);
+    clearInterval(speakTestTimer);
     Native.hideCall(kind);
 }
 
@@ -149,10 +169,16 @@ function showTest(mode: Mode) {
     show(TEST_ID, mode, {
         name: (me as any)?.globalName || me?.username || "Тестовый абонент",
         sub: "Тестовый вызов",
-        avatar: me ? absolute(IconUtils.getUserAvatarURL(me, false, 256)) : FALLBACK_AVATAR
+        avatar: me ? absolute(IconUtils.getUserAvatarURL(me, true, 256)) : FALLBACK_AVATAR
     });
     clearTimeout(testTimer);
+    clearInterval(speakTestTimer);
     testTimer = setTimeout(() => shownChannelId === TEST_ID && hide("missed"), 15_000);
+    if (mode === "talk") {
+        // имитируем речь, чтобы было видно, как оживает аватарка
+        let on = false;
+        speakTestTimer = setInterval(() => Native.setSpeaking(on = !on), 1800);
+    }
 }
 
 function notifyRestart(tag?: string) {
@@ -212,8 +238,18 @@ function sync() {
         ? voiceId
         : null;
 
+    // Разговор: я в звонке, гудки уже никому не идут
+    for (const id of dismissedTalk) if (id !== voiceId) dismissedTalk.delete(id);
+    for (const id of talkStart.keys()) if (id !== voiceId) talkStart.delete(id);
+    const talking = voiceId && live.has(voiceId) && !ringing.has(voiceId) && outgoing !== voiceId ? voiceId : null;
+    if (talking && !talkStart.has(talking)) talkStart.set(talking, Date.now());
+    if (!talking) speakers.clear();
+    const talk = talking && settings.store.showInCall && !dismissedTalk.has(talking) ? talking : null;
+
     if (shownChannelId && shownChannelId !== TEST_ID) {
-        if (shownMode === "in" && !ringing.has(shownChannelId)) {
+        if (shownMode === "talk" && talk !== shownChannelId) {
+            hide("decline");
+        } else if (shownMode === "in" && !ringing.has(shownChannelId)) {
             hide("missed");
         } else if (shownMode === "out" && outgoing !== shownChannelId) {
             // гудки кончились, а я всё ещё в звонке — значит, ответили
@@ -225,16 +261,54 @@ function sync() {
     if (next) {
         // входящий важнее: перекрывает тест и панель исходящего
         if (shownChannelId !== next) show(next, "in", describe(next));
-    } else if (outgoing && !shownChannelId) {
-        show(outgoing, "out", describe(outgoing));
+    } else if (!shownChannelId && (outgoing || talk)) {
+        // даём старой панели доиграть анимацию закрытия
+        if (Date.now() - lastHideAt < 520) return void setTimeout(sync, 540);
+        if (outgoing) show(outgoing, "out", describe(outgoing));
+        else if (talk) {
+            show(talk, "talk", describe(talk));
+            pushSpeaking();
+        }
     }
+}
+
+/** Передаёт в панель разговора, говорит ли сейчас собеседник и кто именно. */
+function pushSpeaking() {
+    if (shownMode !== "talk" || !shownChannelId || shownChannelId === TEST_ID) return;
+
+    const channel = ChannelStore.getChannel(shownChannelId);
+    const group = ((channel as any)?.recipients?.length ?? 0) > 1;
+    // в групповом звонке показываем того, кто говорит
+    const current = [...speakers].pop();
+    if (group && current && current !== shownSpeaker) {
+        const u = UserStore.getUser(current);
+        if (u) {
+            shownSpeaker = current;
+            Native.setSpeaker({
+                name: (u as any).globalName || u.username,
+                sub: "@" + u.username,
+                avatar: absolute(IconUtils.getUserAvatarURL(u, true, 256))
+            });
+        }
+    }
+    Native.setSpeaking(speakers.size > 0);
+}
+
+function onSpeaking(e: any) {
+    const id = e?.userId;
+    if (!id || id === UserStore.getCurrentUser()?.id) return;
+
+    const on = Boolean(e.speakingFlags ?? e.speaking);
+    if (on === speakers.has(id)) return;
+    if (on) speakers.add(id); else speakers.delete(id);
+    pushSpeaking();
 }
 
 const scheduleSync = () => { setTimeout(sync, 60); };
 
 export default definePlugin({
     name: "CyberCall",
-    description: "Входящие и исходящие звонки в киберпанк-стиле поверх игр и рабочего стола: глитч-анимация, кнопки и горячие клавиши.",
+    description: "Звонки в киберпанк-стиле поверх игр и рабочего стола: входящий, исходящий и панель разговора с живой аватаркой.",
     authors: [{ name: "SevereClaw", id: 0n }],
     settings,
 
@@ -243,6 +317,7 @@ export default definePlugin({
         CALL_UPDATE: scheduleSync,
         CALL_DELETE: scheduleSync,
         VOICE_CHANNEL_SELECT: scheduleSync,
+        SPEAKING: onSpeaking,
         CONNECTION_OPEN: scheduleSync
     },
 
@@ -256,16 +331,26 @@ export default definePlugin({
         clearInterval(updateTimer);
         handled.clear();
         wasIncoming.clear();
+        dismissedTalk.clear();
+        talkStart.clear();
+        speakers.clear();
         if (shownChannelId) hide("missed");
     },
 
     /** Вызывается из главного процесса: нажата кнопка или горячая клавиша. */
-    onOverlayAction(action: "accept" | "decline") {
+    onOverlayAction(action: "accept" | "decline" | "dismiss") {
         const id = shownChannelId;
         const mode = shownMode;
         if (!id) return;
-        hide(action);
+        hide(action === "dismiss" ? "missed" : action);
         if (id === TEST_ID) return;
+
+        if (mode === "talk") {
+            if (action === "dismiss") dismissedTalk.add(id);
+            else if (SelectedChannelStore.getVoiceChannelId() === id) VoiceActions.selectVoiceChannel(null);
+            return;
+        }
+        if (action === "dismiss") return;
 
         if (mode === "out") {
             // сброс исходящего — выходим из звонка

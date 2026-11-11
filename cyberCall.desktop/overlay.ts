@@ -8,8 +8,10 @@ export interface OverlayData {
     name: string;
     sub: string;
     avatar: string;
-    /** in — звонят мне, out — звоню я */
-    mode: "in" | "out";
+    /** in — звонят мне, out — звоню я, talk — идёт разговор */
+    mode: "in" | "out" | "talk";
+    /** когда начался разговор (мс), для таймера */
+    startedAt?: number;
     acceptKey: string;
     declineKey: string;
     /** true — панель прижата к правому краю экрана */
@@ -29,6 +31,7 @@ function esc(s: string) {
 
 export function buildOverlayHtml(d: OverlayData) {
     const out = d.mode === "out";
+    const talk = d.mode === "talk";
     const name = esc(d.name);
     const bars = Array.from({ length: out ? 16 : 22 }, (_, i) =>
         `<i style="animation-delay:${out ? i * 90 - 1500 : -((i * 137) % 900)}ms"></i>`).join("");
@@ -78,6 +81,7 @@ body{display:flex;align-items:flex-start;padding:14px;${d.right ? "justify-conte
 .ava{position:relative;flex:none;width:112px;height:136px;
   clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%);
   background:#05070a;outline:1px solid var(--c)}
+.ava::after{content:"";position:absolute;inset:0;border:1px solid var(--c);pointer-events:none;transition:border-color .15s}
 .ava img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
 .ava .base{filter:saturate(.75) contrast(1.15) brightness(.95)}
 .ava .tint{position:absolute;inset:0;background:linear-gradient(180deg,rgba(0,240,255,.28),rgba(0,240,255,.08));mix-blend-mode:screen}
@@ -134,6 +138,29 @@ button:active{transform:translateY(1px)}
 @keyframes dial{0%{opacity:1;background:var(--y)}18%{opacity:.9;background:var(--c)}45%,100%{opacity:.18;background:var(--c)}}
 @keyframes dots{0%{opacity:0}35%,100%{opacity:1}}
 
+/* ---------- разговор ----------
+   Панель висит весь звонок, поэтому в покое ничего не анимируется и не грузит видеокарту.
+   Движение включается только пока собеседник говорит. */
+.mode-talk .sweep{display:none}
+.mode-talk .label{color:var(--c)}
+.mode-talk .label b{background:#39ff88;box-shadow:0 0 8px #39ff88;animation:none}
+.mode-talk .timer{margin-left:auto;color:#f4f7fa;letter-spacing:.12em}
+.mode-talk .ava .lines,.mode-talk .ava .gr,.mode-talk .ava .gc,.mode-talk .ava .slice,
+.mode-talk .name::before,.mode-talk .name::after{animation:none}
+.mode-talk .wave i{animation:none;transform:scaleY(.14);opacity:.4}
+.mode-talk .ava{transition:outline-color .15s, box-shadow .15s}
+.mode-talk.speaking .ava::after{border:3px solid var(--y)}
+.mode-talk.speaking .ava{animation:talk .62s ease-in-out infinite}
+.mode-talk.speaking .ava .base{animation:talkImg .62s ease-in-out infinite}
+.mode-talk.speaking .ava .gr{animation:splitR 1.4s steps(1) infinite}
+.mode-talk.speaking .ava .gc{animation:splitC 1.4s steps(1) infinite}
+.mode-talk.speaking .ava .lines{animation:roll 1s linear infinite}
+.mode-talk.speaking .wave i{animation:wave .9s ease-in-out infinite;opacity:.9;background:var(--y)}
+.mode-talk.speaking .name{text-shadow:0 0 14px rgba(252,238,10,.5)}
+.ghost{background:transparent;color:rgba(0,240,255,.85);outline:1px solid rgba(0,240,255,.5);outline-offset:-1px;padding:0 12px}
+@keyframes talk{0%,100%{transform:translateY(0) scale(1)}30%{transform:translateY(-3px) scale(1.035)}65%{transform:translateY(1px) scale(.99)}}
+@keyframes talkImg{0%,100%{transform:scale(1.02)}50%{transform:scale(1.09)}}
+
 /* ---------- закрытие ---------- */
 body.out .panel{animation:close ${CLOSE_MS}ms cubic-bezier(.7,0,.8,.2) both}
 body.out .content{animation:contentOut .16s steps(3) both}
@@ -173,11 +200,11 @@ body.no .panel::before{background:var(--r)}
   43%{opacity:.9;transform:translate(3px,0);clip-path:inset(0 0 50% 0)}45%{opacity:0}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
-<body class="${out ? "mode-out" : "mode-in"}">
+<body class="mode-${esc(d.mode)}">
 <div class="wrap">
   <div class="panel">
     <div class="corner"></div>
-    <div class="tag">${out ? "HOLO // DIAL" : "HOLO // LINK"}</div>
+    <div class="tag">${out ? "HOLO // DIAL" : talk ? "HOLO // LIVE" : "HOLO // LINK"}</div>
     <div class="sweep"></div>
     <div class="content">
       <div class="ava">
@@ -188,13 +215,15 @@ body.no .panel::before{background:var(--r)}
         <div class="tint"></div><div class="lines"></div><div class="boot"></div>
       </div>
       <div class="info">
-        <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
-        <div class="name" data-t="${name}">${name}</div>
-        <div class="sub">${esc(d.sub)}</div>
+        <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : talk ? 'НА СВЯЗИ<span class="timer" id="timer">00:00</span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
+        <div class="name" id="name" data-t="${name}">${name}</div>
+        <div class="sub" id="sub">${esc(d.sub)}</div>
         <div class="wave">${bars}</div>
         <div class="btns">
+          ${talk ? `<button class="dec" data-a="decline" style="padding-left:14px">ЗАВЕРШИТЬ</button>
+          <button class="ghost" data-a="dismiss">СКРЫТЬ</button>` : `
           ${out ? "" : `<button class="acc" data-a="accept"><kbd>${esc(d.acceptKey)}</kbd>ПРИНЯТЬ</button>`}
-          <button class="dec" data-a="decline"><kbd>${esc(d.declineKey)}</kbd>${out ? "СБРОСИТЬ" : "ОТКЛОНИТЬ"}</button>
+          <button class="dec" data-a="decline"><kbd>${esc(d.declineKey)}</kbd>${out ? "СБРОСИТЬ" : "ОТКЛОНИТЬ"}</button>`}
         </div>
       </div>
     </div>
@@ -204,6 +233,24 @@ body.no .panel::before{background:var(--r)}
 // Клик по кнопке передаётся в главный процесс через заголовок окна.
 document.querySelectorAll("button").forEach(b =>
   b.addEventListener("click", () => { document.title = "cybercall:" + b.dataset.a + ":" + Date.now(); }));
+
+// Разговор: собеседник говорит / сменился говорящий (в групповом звонке)
+window.cyberSpeak = on => document.body.classList.toggle("speaking", !!on);
+window.cyberUser = (name, sub, avatar) => {
+  const n = document.getElementById("name");
+  n.textContent = name; n.dataset.t = name;
+  document.getElementById("sub").textContent = sub;
+  document.querySelectorAll(".ava img").forEach(i => { if (i.src !== avatar) i.src = avatar; });
+};
+const timer = document.getElementById("timer");
+if (timer) {
+  const t0 = ${Number(d.startedAt) || 0} || Date.now();
+  const tick = () => {
+    const s = Math.max(0, Math.floor((Date.now() - t0) / 1000)), p = v => String(v).padStart(2, "0");
+    timer.textContent = (s >= 3600 ? p(Math.floor(s / 3600)) + ":" : "") + p(Math.floor(s / 60) % 60) + ":" + p(s % 60);
+  };
+  tick(); setInterval(tick, 1000);
+}
 
 let audio = null;
 window.cyberClose = kind => {

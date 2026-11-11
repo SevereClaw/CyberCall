@@ -17,7 +17,8 @@ export interface ShowOptions {
     name: string;
     sub: string;
     avatar: string;
-    mode: "in" | "out";
+    mode: "in" | "out" | "talk";
+    startedAt?: number;
     acceptKey: string;
     declineKey: string;
     position: "top-left" | "top-right" | "bottom-left" | "bottom-right";
@@ -25,7 +26,7 @@ export interface ShowOptions {
     ringtoneVolume: number;
 }
 
-type Action = "accept" | "decline";
+type Action = "accept" | "decline" | "dismiss";
 
 const MAX_RINGTONE_BYTES = 15 * 1024 * 1024;
 const MIME: Record<string, string> = {
@@ -114,12 +115,12 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
 
     w.webContents.on("page-title-updated", (ev, title) => {
         ev.preventDefault();
-        const m = /^cybercall:(accept|decline):/.exec(title);
+        const m = /^cybercall:(accept|decline|dismiss):/.exec(title);
         if (m) notify(m[1] as Action);
     });
 
     const html = buildOverlayHtml({
-        name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode,
+        name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
         acceptKey: o.acceptKey, declineKey: o.declineKey, right
     });
     await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
@@ -127,7 +128,8 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
 
     w.showInactive();
     if (o.mode === "in") grabKey(o.acceptKey, "accept");
-    grabKey(o.declineKey, "decline");
+    // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
+    if (o.mode !== "talk") grabKey(o.declineKey, "decline");
 
     // У исходящего свои гудки Discord, рингтон только для входящего
     if (o.mode !== "in") return;
@@ -160,6 +162,20 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
 
     w.webContents.executeJavaScript(`cyberClose(${JSON.stringify(kind)})`).catch(() => { });
     setTimeout(() => destroy(w), CLOSE_MS + 60);
+}
+
+function run(js: string) {
+    if (win && !win.isDestroyed()) win.webContents.executeJavaScript(js).catch(() => { });
+}
+
+/** Собеседник начал или перестал говорить. */
+export function setSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
+    run(`cyberSpeak(${speaking ? "true" : "false"})`);
+}
+
+/** В групповом звонке сменился говорящий. */
+export function setSpeaker(_: IpcMainInvokeEvent, info: { name: string; sub: string; avatar: string; }) {
+    run(`cyberUser(${JSON.stringify(String(info.name))},${JSON.stringify(String(info.sub))},${JSON.stringify(String(info.avatar))})`);
 }
 
 /** Проверяет релизы на GitHub и, если вышла новая сборка, скачивает её. */
