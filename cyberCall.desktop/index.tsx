@@ -10,6 +10,8 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
 import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore } from "@webpack/common";
 
+import { installRingMuter, setRingMuted, uninstallRingMuter } from "./muteRing";
+
 const Native = VencordNative.pluginHelpers.CyberCall as PluginNative<typeof import("./native")>;
 const VoiceActions = findByPropsLazy("selectVoiceChannel", "selectChannel");
 
@@ -74,6 +76,11 @@ const settings = definePluginSettings({
         markers: [0, 25, 50, 75, 100],
         default: 70,
         stickToMarkers: false
+    },
+    muteDiscordRing: {
+        type: OptionType.BOOLEAN,
+        description: "Глушить стандартную мелодию звонка Discord, пока играет свой рингтон",
+        default: true
     },
     showOutgoing: {
         type: OptionType.BOOLEAN,
@@ -143,6 +150,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     shownMode = mode;
     shownSpeaker = null;
     const s = settings.store;
+    setRingMuted(mode === "in" && channelId !== TEST_ID && s.muteDiscordRing && s.ringtoneVolume > 0);
     Native.showCall({
         ...info,
         mode,
@@ -159,6 +167,7 @@ function hide(kind: "accept" | "decline" | "missed") {
     shownChannelId = null;
     shownSpeaker = null;
     lastHideAt = Date.now();
+    setRingMuted(false);
     clearTimeout(testTimer);
     clearInterval(speakTestTimer);
     Native.hideCall(kind);
@@ -322,12 +331,14 @@ export default definePlugin({
     },
 
     start() {
+        installRingMuter();
         scheduleSync();
         setTimeout(() => checkUpdate(), 15_000);
         updateTimer = setInterval(() => checkUpdate(), UPDATE_INTERVAL);
     },
 
     stop() {
+        uninstallRingMuter();
         clearInterval(updateTimer);
         handled.clear();
         wasIncoming.clear();
