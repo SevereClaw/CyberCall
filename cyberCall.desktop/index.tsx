@@ -36,6 +36,11 @@ const talkStart = new Map<string, number>();
 const speakers = new Set<string>();
 let shownSpeaker: string | null = null;
 let lastHideAt = 0;
+/** в каком голосовом канале я был при прошлой сверке и когда в него вошёл */
+let lastVoiceId: string | null = null;
+let voiceJoinedAt = 0;
+/** сколько ждать после входа в свой звонок: гудки собеседнику начинаются не сразу */
+const OUTGOING_GRACE = 1500;
 let speakTestTimer: ReturnType<typeof setInterval> | undefined;
 /** звонки, на которые уже ответили — чтобы оверлей не всплыл повторно, пока Discord обновляет состояние */
 const handled = new Set<string>();
@@ -58,7 +63,7 @@ async function copyJournal() {
     const s = settings.store;
     const head = [
         "CyberCall " + await Native.getVersion().catch(() => "?"),
-        `настройки: субтитры=${s.subtitles}/${s.subtitleLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
+        `настройки: субтитры=${s.captions}/${s.subtitleLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
         ringMuterReport()
     ];
     await copyToClipboard([...head, ...journal].join("\n"));
@@ -186,7 +191,7 @@ const settings = definePluginSettings({
         description: "Показывать панель разговора после ответа: аватарка оживает, когда собеседник говорит",
         default: true
     },
-    subtitles: {
+    captions: {
         type: OptionType.BOOLEAN,
         description: "Субтитры: текст речи собеседника под панелью разговора. Распознаётся на компьютере, звук никуда не отправляется. При первом звонке скачает около 45 МБ, во время звонка занимает около 400 МБ памяти",
         default: true
@@ -263,7 +268,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     const s = settings.store;
     const ownRingtone = s.ringtoneVolume > 0 && (mode === "in" || (mode === "out" && s.ringtoneOutgoing));
     setRingMuted(ownRingtone && channelId !== TEST_ID && s.muteDiscordRing);
-    log(`показываю панель: ${mode}${channelId === TEST_ID ? " (тест)" : ""}, свой рингтон=${ownRingtone}, субтитры=${mode === "talk" && s.subtitles}`);
+    log(`показываю панель: ${mode}${channelId === TEST_ID ? " (тест)" : ""}, свой рингтон=${ownRingtone}, субтитры=${mode === "talk" && s.captions}`);
     Native.showCall({
         ...info,
         mode,
@@ -278,7 +283,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         theme: s.theme as string,
         accent: s.accent as string,
         monitor: s.monitor as string,
-        subtitles: s.subtitles,
+        subtitles: s.captions,
         subtitleLang: s.subtitleLang as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
@@ -360,12 +365,19 @@ function sync() {
     const live = new Set<string>(calls.map(c => c.channelId));
     const ringing = new Set<string>(calls.filter(c => c?.ringing?.includes(meId)).map(c => c.channelId));
 
+    const voiceId = SelectedChannelStore.getVoiceChannelId() ?? null;
+    if (voiceId !== lastVoiceId) {
+        lastVoiceId = voiceId;
+        voiceJoinedAt = Date.now();
+    }
+
+    // «Мне звонили» помним, только пока звонят или пока я в этом звонке:
+    // если я вышел и набрал сам — это уже мой исходящий
     for (const id of ringing) wasIncoming.add(id);
-    for (const id of wasIncoming) if (!live.has(id)) wasIncoming.delete(id);
+    for (const id of wasIncoming) if (!live.has(id) || (id !== voiceId && !ringing.has(id))) wasIncoming.delete(id);
     for (const id of handled) if (!ringing.has(id)) handled.delete(id);
 
     // Исходящий: я сижу в звонке, который начал сам, и кому-то ещё идут гудки
-    const voiceId = SelectedChannelStore.getVoiceChannelId();
     const outgoing = settings.store.showOutgoing && voiceId && !wasIncoming.has(voiceId)
         && calls.some(c => c.channelId === voiceId && c.ringing?.some(id => id !== meId))
         ? voiceId
@@ -375,9 +387,19 @@ function sync() {
     for (const id of dismissedTalk) if (id !== voiceId) dismissedTalk.delete(id);
     for (const id of talkStart.keys()) if (id !== voiceId) talkStart.delete(id);
     const talking = voiceId && live.has(voiceId) && !ringing.has(voiceId) && outgoing !== voiceId ? voiceId : null;
+    // пока идут гудки, разговор ещё не начался — таймер пойдёт с момента ответа
+    if (outgoing) talkStart.delete(outgoing);
     if (talking && !talkStart.has(talking)) talkStart.set(talking, Date.now());
     if (!talking) speakers.clear();
-    const talk = talking && settings.store.showInCall && !dismissedTalk.has(talking) ? talking : null;
+    let talk = talking && settings.store.showInCall && !dismissedTalk.has(talking) ? talking : null;
+
+    // Я только что сам вошёл в звонок: гудки собеседнику Discord начинает на секунду позже.
+    // Ждём, чтобы вместо панели исходящего не мелькнула панель разговора.
+    const sinceJoin = Date.now() - voiceJoinedAt;
+    if (talk && talk !== shownChannelId && !wasIncoming.has(talk) && sinceJoin < OUTGOING_GRACE) {
+        talk = null;
+        setTimeout(sync, OUTGOING_GRACE - sinceJoin + 50);
+    }
 
     const state = `звонков=${calls.length} [${calls.map(c => `гудки:${c.ringing?.length ?? 0}${c.ringing?.includes(meId) ? "(мне)" : ""}`).join(" ")}] я в голосе=${Boolean(voiceId)} в звонке=${Boolean(voiceId && live.has(voiceId))} → входящий=${ringing.size} исходящий=${Boolean(outgoing)} разговор=${Boolean(talk)}`;
     if (state !== lastSyncState) log(lastSyncState = state);
@@ -469,6 +491,7 @@ export default definePlugin({
         clearInterval(updateTimer);
         handled.clear();
         wasIncoming.clear();
+        lastVoiceId = null;
         dismissedTalk.clear();
         talkStart.clear();
         speakers.clear();
