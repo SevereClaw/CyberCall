@@ -20,8 +20,8 @@ export interface OverlayData {
     scale: number;
     /** показывать строку субтитров и подключить распознавание речи (только для разговора) */
     subs?: boolean;
-    /** моё окно с моими субтитрами (только вместе с subs): моё имя и аватарка */
-    me?: { name: string; avatar: string; } | null;
+    /** моё окно: такая же панель, как у собеседника, но с моим ником и аватаркой (только для разговора) */
+    me?: { name: string; sub: string; avatar: string; } | null;
     /** название готовой палитры или "custom" */
     theme?: string;
     /** свой акцентный цвет (#rrggbb) для палитры "custom" */
@@ -83,28 +83,29 @@ export function resolveTheme(theme?: string, accent?: string): Theme {
     return THEMES[theme ?? ""] ?? THEMES.neon;
 }
 
-const BASE = {
-    compact: { width: 548, height: 204 },
-    big: { width: 348, height: 498 }
-};
-
+/** размер одной панели и поля вокруг содержимого окна */
+const PANEL = { compact: { width: 520, height: 176 }, big: { width: 320, height: 470 } };
+const PAD = 14, GAP = 8;
 /** высота строки субтитров под панелью */
 const SUBS_HEIGHT = { compact: 66, big: 104 };
-
-/** высота моего окна с моими субтитрами */
-const MINE_HEIGHT = { compact: 60, big: 96 };
 
 export function clampScale(scale: number) {
     return Math.min(2, Math.max(0.5, Number(scale) || 1));
 }
 
-/** Размер окна оверлея для выбранного вида и масштаба. */
-export function overlaySize(layout: "compact" | "big", scale: number, subs = false, mine = false) {
-    const b = BASE[layout === "big" ? "big" : "compact"], s = clampScale(scale);
-    const extra = (subs ? (layout === "big" ? SUBS_HEIGHT.big : SUBS_HEIGHT.compact) + 8 : 0)
-        + (subs && mine ? (layout === "big" ? MINE_HEIGHT.big : MINE_HEIGHT.compact) + 8 : 0);
-    return { width: Math.ceil(b.width * s), height: Math.ceil((b.height + extra) * s) };
+/**
+ * Размер окна оверлея. С «моим окном» панелей две: в обычном виде они стоят друг под другом,
+ * в крупном — рядом. Под каждой может быть строка субтитров.
+ */
+export function overlaySize(layout: "compact" | "big", scale: number, subs = false, me = false) {
+    const key = layout === "big" ? "big" : "compact", p = PANEL[key], s = clampScale(scale);
+    const column = p.height + (subs ? GAP + SUBS_HEIGHT[key] : 0);
+    const columns = me ? 2 : 1;
+    const width = key === "big" ? p.width * columns + GAP * (columns - 1) : p.width;
+    const height = key === "big" ? column : column * columns + GAP * (columns - 1);
+    return { width: Math.ceil((width + PAD * 2) * s), height: Math.ceil((height + PAD * 2) * s) };
 }
+
 /** Длительность анимации закрытия, мс */
 export const CLOSE_MS = 420;
 
@@ -121,7 +122,7 @@ function esc(s: string) {
  */
 const SUBS_SCRIPT = String.raw`
 const subsEl = document.getElementById("subs"), whoEl = subsEl.querySelector(".who"), txtEl = subsEl.querySelector(".txt");
-const mineEl = document.getElementById("mine"), mineTxt = document.getElementById("mineTxt");
+const mineEl = document.getElementById("mine");
 let subsTimer = 0, mineTimer = 0;
 const subsHideIn = ms => { clearTimeout(subsTimer); subsTimer = setTimeout(() => subsEl.classList.remove("on"), ms); };
 const sendLog = text => { document.title = "cybercall:log:" + encodeURIComponent(text) + ":" + Date.now(); };
@@ -141,29 +142,21 @@ const caption = (text, final) => {
   subsEl.className = "subs on";
   subsHideIn(final ? 6000 : 10000);
 };
-// мои слова — в моём окне под панелью
+// мои слова — в строке под моей панелью
+const mineShow = (who, text, status, hold) => {
+  if (!mineEl) return;
+  mineEl.querySelector(".who").textContent = who;
+  mineEl.querySelector(".txt").textContent = text;
+  mineEl.className = "subs" + (text ? " on" : "") + (status ? " status" : "");
+  clearTimeout(mineTimer);
+  if (hold) mineTimer = setTimeout(() => mineEl.classList.remove("on"), hold);
+};
 const mineCaption = (text, final) => {
   text = nice(text);
-  if (!text || !mineEl) return;
-  mineTxt.textContent = text;
-  mineTxt.classList.remove("dim");
-  clearTimeout(mineTimer);
-  mineTimer = setTimeout(() => { mineTxt.textContent = ""; }, final ? 6000 : 10000);
+  if (text) mineShow(document.getElementById("myName").textContent, text, false, final ? 6000 : 10000);
 };
-const mineStatus = text => { if (mineEl) { mineTxt.textContent = text; mineTxt.classList.add("dim"); clearTimeout(mineTimer); } };
-
-// Сигналы «я говорю» и «я выключил микрофон» от Discord
-let selfSpeaking = false, selfSpokeEver = false, selfMuted = false;
-window.cyberSelfSpeak = on => {
-  selfSpeaking = !!on;
-  if (selfSpeaking) selfSpokeEver = true;
-  if (mineEl) mineEl.classList.toggle("speaking", selfSpeaking);
-};
-window.cyberSelfMuted = on => {
-  selfMuted = !!on;
-  if (mineEl) mineEl.classList.toggle("muted", selfMuted);
-  if (selfMuted) mineStatus("микрофон выключен"); else if (mineTxt && mineTxt.classList.contains("dim")) mineTxt.textContent = "";
-};
+const mineStatus = (text, hold) => mineShow("", text, true, hold);
+onSelfMuted = muted => { if (muted) mineStatus("Микрофон выключен — твоя речь не распознаётся", 4000); };
 
 let sttModel = null;
 window.cyberSubsInit = async cfg => {
@@ -283,7 +276,6 @@ window.cyberSubsStart = async cfg => {
   let ctx;
   try {
     cyberSubsStatus("Запуск распознавания речи…");
-    if (!selfMuted) mineStatus("запуск…");
     await cyberSubsInit(cfg);
     const stream = await Promise.race([
       captureSystemAudio(),
@@ -309,10 +301,10 @@ window.cyberSubsStart = async cfg => {
     ctx = ctx || new AudioContext();
     pipe(ctx, mic, cyberMineFeed);
     if (ctx.state === "suspended") await ctx.resume();
-    if (!selfMuted) mineStatus("");
+    mineStatus("Твои субтитры включены", 2500);
     sendLog("мои субтитры включены, микрофон: " + mic.getAudioTracks()[0].label);
   } catch (e) {
-    mineStatus("микрофон недоступен");
+    mineStatus("Микрофон недоступен: " + (e && e.message || e), 20000);
     sendLog("мои субтитры не запустились: " + (e && e.message || e) + (e && e.name ? " [" + e.name + "]" : ""));
   }
 };
@@ -323,6 +315,14 @@ export function buildOverlayHtml(d: OverlayData) {
     const talk = d.mode === "talk";
     const big = d.layout === "big";
     const t = resolveTheme(d.theme, d.accent);
+    const me = talk && d.me ? d.me : null;
+    const avatarHtml = (url: string) => `<div class="ava">
+        <img class="base" src="${esc(url)}" alt="">
+        <img class="gr" src="${esc(url)}" alt="">
+        <img class="gc" src="${esc(url)}" alt="">
+        <img class="slice" src="${esc(url)}" alt="">
+        <div class="tint"></div><div class="lines"></div><div class="boot"></div>
+      </div>`;
     const name = esc(d.name);
     const bars = Array.from({ length: out ? 16 : 22 }, (_, i) =>
         `<i style="animation-delay:${out ? i * 90 - 1500 : -((i * 137) % 900)}ms"></i>`).join("");
@@ -341,7 +341,9 @@ export function buildOverlayHtml(d: OverlayData) {
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;font-family:var(--font)}
-body{display:flex;align-items:flex-start;padding:14px;zoom:${clampScale(d.scale)}}
+body{display:flex;flex-direction:column;align-items:flex-start;gap:${GAP}px;padding:${PAD}px;zoom:${clampScale(d.scale)}}
+body.big{flex-direction:row}
+.col{flex:none;display:flex;flex-direction:column;gap:${GAP}px}
 .panel{cursor:grab}
 body.dragging .panel,body.dragging button{cursor:grabbing}
 
@@ -457,21 +459,20 @@ button:active{transform:translateY(1px)}
 .mode-talk .name::before,.mode-talk .name::after{animation:none}
 .mode-talk .wave i{animation:none;transform:scaleY(.14);opacity:.4}
 .mode-talk .ava{transition:outline-color .15s, box-shadow .15s}
-.mode-talk.speaking .ava::after{border:3px solid var(--y)}
-.mode-talk.speaking .ava{animation:talk .62s ease-in-out infinite}
-.mode-talk.speaking .ava .base{animation:talkImg .62s ease-in-out infinite}
-.mode-talk.speaking .ava .gr{animation:splitR 1.4s steps(1) infinite}
-.mode-talk.speaking .ava .gc{animation:splitC 1.4s steps(1) infinite}
-.mode-talk.speaking .ava .lines{animation:roll 1s linear infinite}
-.mode-talk.speaking .wave i{animation:wave .9s ease-in-out infinite;opacity:.9;background:var(--y)}
-.mode-talk.speaking .name{text-shadow:0 0 14px rgb(var(--y-rgb) / .5)}
+.mode-talk .wrap.speaking .ava::after{border:3px solid var(--y)}
+.mode-talk .wrap.speaking .ava{animation:talk .62s ease-in-out infinite}
+.mode-talk .wrap.speaking .ava .base{animation:talkImg .62s ease-in-out infinite}
+.mode-talk .wrap.speaking .ava .gr{animation:splitR 1.4s steps(1) infinite}
+.mode-talk .wrap.speaking .ava .gc{animation:splitC 1.4s steps(1) infinite}
+.mode-talk .wrap.speaking .ava .lines{animation:roll 1s linear infinite}
+.mode-talk .wrap.speaking .wave i{animation:wave .9s ease-in-out infinite;opacity:.9;background:var(--y)}
+.mode-talk .wrap.speaking .name{text-shadow:0 0 14px rgb(var(--y-rgb) / .5)}
 .ghost{background:transparent;color:rgb(var(--c-rgb) / .85);outline:1px solid rgb(var(--c-rgb) / .5);outline-offset:-1px;padding:0 12px}
 @keyframes talk{0%,100%{transform:translateY(0) scale(1)}30%{transform:translateY(-3px) scale(1.035)}65%{transform:translateY(1px) scale(.99)}}
 @keyframes talkImg{0%,100%{transform:scale(1.02)}50%{transform:scale(1.09)}}
 
 /* ---------- субтитры ---------- */
-body.has-subs{flex-direction:column}
-.subs{flex:none;width:520px;height:${SUBS_HEIGHT.compact}px;margin-top:8px;padding:6px 12px 7px;overflow:hidden;
+.subs{flex:none;width:520px;height:${SUBS_HEIGHT.compact}px;padding:6px 12px 7px;overflow:hidden;
   display:flex;flex-direction:column;justify-content:flex-end;
   background:rgba(8,10,14,.84);border-left:3px solid var(--y);
   font-size:15px;line-height:18px;font-weight:600;color:#f4f7fa;text-shadow:0 1px 2px #000;
@@ -482,23 +483,13 @@ body.has-subs{flex-direction:column}
 .subs.status{font-size:12px;letter-spacing:.08em;font-weight:400;color:rgb(var(--c-rgb) / .9);border-left-color:var(--c)}
 body.out .subs{opacity:0;transition:opacity .12s}
 
-/* ---------- моё окно ---------- */
-.mine{flex:none;width:520px;height:${MINE_HEIGHT.compact}px;margin-top:8px;display:flex;gap:11px;padding:8px 12px 8px 9px;overflow:hidden;
-  background:rgba(8,10,14,.9);border-left:3px solid var(--c);
-  clip-path:polygon(0 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%);
-  animation:content .45s ease-out .5s both}
-.big .mine{width:320px;height:${MINE_HEIGHT.big}px}
-.mava{position:relative;flex:none;width:44px;height:44px;background:#05070a;border:1px solid rgb(var(--c-rgb) / .7);transition:border-color .15s}
-.mava img{width:100%;height:100%;object-fit:cover;display:block}
-.mine.speaking .mava{border:2px solid var(--y);animation:talk .62s ease-in-out infinite}
-.mine.muted .mava{filter:grayscale(1) brightness(.6)}
-.mbody{flex:1;min-width:0;display:flex;flex-direction:column}
-.mwho{font-size:10px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mine.speaking .mwho{color:var(--y)}
-.mline{flex:1;min-height:0;margin-top:2px;overflow:hidden;display:flex;flex-direction:column;justify-content:flex-end;
-  font-size:14px;line-height:17px;font-weight:600;color:#f4f7fa;text-shadow:0 1px 2px #000}
-.mline.dim{font-size:11px;font-weight:400;letter-spacing:.08em;color:rgb(var(--c-rgb) / .7)}
-body.out .mine{opacity:0;transition:opacity .12s}
+/* ---------- моё окно: та же панель, но про меня ---------- */
+.wrap.me .label b{background:#39ff88;box-shadow:0 0 8px #39ff88}
+.wrap.me.muted .label{color:var(--r)}
+.wrap.me.muted .label b{background:var(--r);box-shadow:0 0 8px var(--r)}
+.wrap.me.muted .ava .base{filter:grayscale(1) brightness(.55)}
+.wrap.me .on-muted,.wrap.me.muted .on-live{display:none}
+.wrap.me.muted .on-muted{display:inline}
 
 /* ---------- закрытие ---------- */
 body.out .panel{animation:close ${CLOSE_MS}ms cubic-bezier(.7,0,.8,.2) both}
@@ -539,20 +530,15 @@ body.no .panel::before{background:var(--r)}
   43%{opacity:.9;transform:translate(3px,0);clip-path:inset(0 0 50% 0)}45%{opacity:0}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
-<body class="mode-${esc(d.mode)}${big ? " big" : ""}${d.subs ? " has-subs" : ""}">
-<div class="wrap">
+<body class="mode-${esc(d.mode)}${big ? " big" : ""}">
+<div class="col">
+<div class="wrap" id="wOther">
   <div class="panel">
     <div class="corner"></div>
     <div class="tag">${out ? "HOLO // DIAL" : talk ? "HOLO // LIVE" : "HOLO // LINK"}</div>
     <div class="sweep"></div>
     <div class="content">
-      <div class="ava">
-        <img class="base" src="${esc(d.avatar)}" alt="">
-        <img class="gr" src="${esc(d.avatar)}" alt="">
-        <img class="gc" src="${esc(d.avatar)}" alt="">
-        <img class="slice" src="${esc(d.avatar)}" alt="">
-        <div class="tint"></div><div class="lines"></div><div class="boot"></div>
-      </div>
+      ${avatarHtml(d.avatar)}
       <div class="info">
         <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : talk ? 'НА СВЯЗИ<span class="timer" id="timer">00:00</span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
         <div class="name" id="name" data-t="${name}">${name}</div>
@@ -569,7 +555,28 @@ body.no .panel::before{background:var(--r)}
   </div>
 </div>
 ${d.subs ? '<div class="subs" id="subs"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
-${d.subs && d.me ? `<div class="mine" id="mine"><div class="mava"><img src="${esc(d.me.avatar)}" alt=""></div><div class="mbody"><div class="mwho">${esc(d.me.name)} · Я</div><div class="mline"><div id="mineTxt"></div></div></div></div>` : ""}
+</div>
+${me ? `<div class="col">
+<div class="wrap me" id="wMe">
+  <div class="panel">
+    <div class="corner"></div>
+    <div class="tag">HOLO // SELF</div>
+    <div class="content">
+      ${avatarHtml(me.avatar)}
+      <div class="info">
+        <div class="label"><b></b><span class="on-live">ЭТО ТЫ</span><span class="on-muted">МИКРОФОН ВЫКЛЮЧЕН</span></div>
+        <div class="name" id="myName" data-t="${esc(me.name)}">${esc(me.name)}</div>
+        <div class="sub">${esc(me.sub)}</div>
+        <div class="wave">${bars}</div>
+        <div class="btns">
+          <button class="ghost" data-a="mic"><span class="on-live">ВЫКЛЮЧИТЬ МИКРОФОН</span><span class="on-muted">ВКЛЮЧИТЬ МИКРОФОН</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+${d.subs ? '<div class="subs" id="mine"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
+</div>` : ""}
 <script>
 // Клик по кнопке передаётся в главный процесс через заголовок окна.
 document.querySelectorAll("button").forEach(b =>
@@ -580,13 +587,26 @@ let speaking = false, lastVoice = 0, spokeEver = false;
 window.cyberSpeak = on => {
   speaking = !!on;
   if (speaking) { lastVoice = Date.now(); spokeEver = true; }
-  document.body.classList.toggle("speaking", speaking);
+  document.getElementById("wOther").classList.toggle("speaking", speaking);
+};
+// Моё окно: сигналы «я говорю» и «я выключил микрофон» от Discord
+const wMe = document.getElementById("wMe");
+let selfSpeaking = false, selfSpokeEver = false, selfMuted = false, onSelfMuted = null;
+window.cyberSelfSpeak = on => {
+  selfSpeaking = !!on;
+  if (selfSpeaking) selfSpokeEver = true;
+  if (wMe) wMe.classList.toggle("speaking", selfSpeaking && !selfMuted);
+};
+window.cyberSelfMuted = on => {
+  selfMuted = !!on;
+  if (wMe) { wMe.classList.toggle("muted", selfMuted); if (selfMuted) wMe.classList.remove("speaking"); }
+  if (onSelfMuted) onSelfMuted(selfMuted);
 };
 window.cyberUser = (name, sub, avatar) => {
   const n = document.getElementById("name");
   n.textContent = name; n.dataset.t = name;
   document.getElementById("sub").textContent = sub;
-  document.querySelectorAll(".ava img").forEach(i => { if (i.src !== avatar) i.src = avatar; });
+  document.querySelectorAll("#wOther .ava img").forEach(i => { if (i.src !== avatar) i.src = avatar; });
 };
 const timer = document.getElementById("timer");
 if (timer) {
@@ -599,7 +619,6 @@ if (timer) {
 }
 
 // Перетаскивание: страница только сообщает о начале и конце, окно двигает главный процесс.
-const panel = document.querySelector(".panel");
 let dragging = false;
 const endDrag = () => {
   if (!dragging) return;
@@ -607,16 +626,18 @@ const endDrag = () => {
   document.body.classList.remove("dragging");
   document.title = "cybercall:dragend:" + Date.now();
 };
-panel.addEventListener("pointerdown", e => {
-  if (e.button !== 0 || e.target.closest("button")) return;
-  dragging = true;
-  document.body.classList.add("dragging");
-  try { panel.setPointerCapture(e.pointerId); } catch {}
-  document.title = "cybercall:dragstart:" + Date.now();
+document.querySelectorAll(".panel").forEach(panel => {
+  panel.addEventListener("pointerdown", e => {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    dragging = true;
+    document.body.classList.add("dragging");
+    try { panel.setPointerCapture(e.pointerId); } catch {}
+    document.title = "cybercall:dragstart:" + Date.now();
+  });
+  panel.addEventListener("pointerup", endDrag);
+  panel.addEventListener("pointercancel", endDrag);
+  panel.addEventListener("lostpointercapture", endDrag);
 });
-panel.addEventListener("pointerup", endDrag);
-panel.addEventListener("pointercancel", endDrag);
-panel.addEventListener("lostpointercapture", endDrag);
 
 ${d.subs ? SUBS_SCRIPT : ""}
 let audio = null;

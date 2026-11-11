@@ -16,6 +16,7 @@ import { installRingMuter, ringMuterReport, setRingMuted, uninstallRingMuter } f
 
 const Native = VencordNative.pluginHelpers.CyberCall as PluginNative<typeof import("./native")>;
 const VoiceActions = findByPropsLazy("selectVoiceChannel", "selectChannel");
+const MuteActions = findByPropsLazy("toggleSelfMute");
 
 const TEST_ID = "cybercall-test";
 const FALLBACK_AVATAR = "https://cdn.discordapp.com/embed/avatars/0.png";
@@ -42,6 +43,7 @@ let voiceJoinedAt = 0;
 /** сколько ждать после входа в свой звонок: гудки собеседнику начинаются не сразу */
 const OUTGOING_GRACE = 1500;
 let speakTestTimer: ReturnType<typeof setInterval> | undefined;
+let testMuted = false;
 /** звонки, на которые уже ответили — чтобы оверлей не всплыл повторно, пока Discord обновляет состояние */
 const handled = new Set<string>();
 let testTimer: ReturnType<typeof setTimeout> | undefined;
@@ -199,7 +201,7 @@ const settings = definePluginSettings({
     },
     ownCaptions: {
         type: OptionType.BOOLEAN,
-        description: "Моё окно: под панелью разговора — моя аватарка и субтитры моей речи с микрофона (работает вместе с субтитрами)",
+        description: "Моё окно: во время разговора рядом с панелью собеседника такая же панель с моим ником и аватаркой. Оживает, когда говорю я; с включёнными субтитрами показывает и мою речь",
         default: true
     },
     subtitleLang: {
@@ -286,7 +288,8 @@ function selfInfo() {
     } catch { }
     return {
         selfName: (me as any)?.globalName || me?.username || "Я",
-        selfAvatar: me ? absolute(IconUtils.getUserAvatarURL(me, true, 128)) : FALLBACK_AVATAR,
+        selfSub: me ? "@" + me.username : "",
+        selfAvatar: me ? absolute(IconUtils.getUserAvatarURL(me, true, 256)) : FALLBACK_AVATAR,
         selfMuted: isSelfMuted(),
         micLabel
     };
@@ -348,7 +351,13 @@ function showTest(mode: Mode) {
     if (mode === "talk") {
         // имитируем речь, чтобы было видно, как оживает аватарка
         let on = false;
-        speakTestTimer = setInterval(() => Native.setSpeaking(on = !on), 1800);
+        testMuted = false;
+        // собеседник и я «говорим» по очереди
+        speakTestTimer = setInterval(() => {
+            on = !on;
+            Native.setSpeaking(on);
+            Native.setSelfSpeaking(!on);
+        }, 1800);
     }
 }
 
@@ -563,10 +572,21 @@ export default definePlugin({
     },
 
     /** Вызывается из главного процесса: нажата кнопка или горячая клавиша. */
-    onOverlayAction(action: "accept" | "decline" | "dismiss") {
+    onOverlayAction(action: "accept" | "decline" | "dismiss" | "mic") {
         const id = shownChannelId;
         const mode = shownMode;
         if (!id) return;
+
+        // кнопка микрофона в моём окне: панель остаётся на месте
+        if (action === "mic") {
+            if (id === TEST_ID) return void Native.setSelfMuted(testMuted = !testMuted);
+            try {
+                MuteActions.toggleSelfMute();
+            } catch (e) {
+                log("не удалось переключить микрофон: " + String(e));
+            }
+            return;
+        }
         hide(action === "dismiss" ? "missed" : action);
         if (id === TEST_ID) return;
 

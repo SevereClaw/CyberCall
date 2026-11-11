@@ -35,9 +35,10 @@ export interface ShowOptions {
     /** субтитры речи собеседника в панели разговора */
     subtitles: boolean;
     subtitleLang: string;
-    /** моё окно с моими субтитрами */
+    /** моё окно: вторая панель с моим ником и аватаркой */
     ownCaptions: boolean;
     selfName: string;
+    selfSub: string;
     selfAvatar: string;
     selfMuted: boolean;
     /** название микрофона, выбранного в Discord */
@@ -50,7 +51,7 @@ export interface ShowOptions {
     ringtoneOutgoing: boolean;
 }
 
-type Action = "accept" | "decline" | "dismiss";
+type Action = "accept" | "decline" | "dismiss" | "mic";
 
 const MAX_RINGTONE_BYTES = 15 * 1024 * 1024;
 const MIME: Record<string, string> = {
@@ -162,7 +163,7 @@ async function openCall(o: ShowOptions) {
 
     const subs = o.mode === "talk" && !!o.subtitles;
     if (subs) sttSession();
-    const mine = subs && !!o.ownCaptions;
+    const mine = o.mode === "talk" && !!o.ownCaptions;
     const { width, height } = overlaySize(o.layout, o.scale / 100, subs, mine);
     const area = pickDisplay(o.monitor).workArea;
     let pos = {
@@ -215,7 +216,7 @@ async function openCall(o: ShowOptions) {
 
     w.webContents.on("page-title-updated", (ev, title) => {
         ev.preventDefault();
-        const m = /^cybercall:(accept|decline|dismiss|dragstart|dragend):/.exec(title);
+        const m = /^cybercall:(accept|decline|dismiss|mic|dragstart|dragend):/.exec(title);
         if (title.startsWith("cybercall:log:")) {
             try { log("панель: " + decodeURIComponent(title.slice(14).replace(/:\d+$/, ""))); } catch { }
             return;
@@ -231,7 +232,7 @@ async function openCall(o: ShowOptions) {
         acceptKey: o.acceptKey, declineKey: o.declineKey,
         layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100),
         theme: o.theme, accent: o.accent, subs,
-        me: mine ? { name: o.selfName, avatar: o.selfAvatar } : null
+        me: mine ? { name: o.selfName, sub: o.selfSub, avatar: o.selfAvatar } : null
     });
 
     // Для субтитров странице нужен «настоящий» адрес: с data:-страницы нельзя слушать звук и грузить модель
@@ -272,10 +273,8 @@ async function openCall(o: ShowOptions) {
     // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
     if (o.mode !== "talk") grabKey(o.declineKey, "decline");
 
-    if (subs) {
-        if (mine && o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
-        startSubtitles(w, server, o.subtitleLang, mine ? o.micLabel : "");
-    }
+    if (mine && o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
+    if (subs) startSubtitles(w, server, o.subtitleLang, mine ? o.micLabel : "");
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
