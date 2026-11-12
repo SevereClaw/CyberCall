@@ -77,7 +77,7 @@ let keys: string[] = [];
 /** Пишет строку в журнал плагина (его можно скопировать из настроек). */
 function log(text: string) {
     if (!owner || owner.isDestroyed()) return;
-    owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onNativeLog(${JSON.stringify(String(text).slice(0, 400))})`).catch(() => { });
+    owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onNativeLog(${JSON.stringify(String(text).slice(0, 600))})`).catch(() => { });
 }
 
 function notify(action: Action) {

@@ -325,6 +325,9 @@ function dropSource(src) {
   src.nodes[1].onaudioprocess = null;
 }
 
+let decideTries = 0;
+const shortLabel = label => label.replace(/\s*\((VB-Audio[^)]*|[^)]*WDM[^)]*)\)\s*$/, "");
+
 function decideSource() {
   if (sourceDecided || !activeSource) return;
   // ждём несколько секунд речи собеседника и несколько секунд пауз: источник, где одинаково
@@ -335,16 +338,29 @@ function decideSource() {
   if (offN < 20 && !longWait) return;
   const mean = (sum, n) => n ? sum / n : 0;
   const scored = remoteSources.map(s => ({ s, on: mean(s.on, s.onN), off: mean(s.off, s.offN) }));
-  const cur = scored.find(x => x.s === activeSource);
-  const candidates = offN >= 20
-    ? scored.filter(x => x.on > 0.008 && x.on > x.off * 1.5)
-    : (cur.on < 0.004 ? scored.filter(x => x.on > 0.008) : []);
-  const best = candidates.sort((a, b) => (b.on - b.off) - (a.on - a.off))[0];
-  if (best && best.s !== activeSource && best.on - best.off > (cur.on - cur.off) * 2.5) activeSource = best.s;
+  const voice = x => x.on > 0.008 && (offN >= 20 ? x.on > x.off * 1.5 : true);
+  const best = scored.filter(voice).sort((a, b) => (b.on - b.off) - (a.on - a.off))[0];
+  decideTries++;
+
+  // по одной строке на источник: в общую строку всё не помещается
+  if (decideTries === 1 || best)
+    scored.forEach(x => sendLog("источник «" + shortLabel(x.s.label) + "»: при речи собеседника=" + x.on.toFixed(3) + ", в паузах=" + x.off.toFixed(3)));
+
+  if (!best) {
+    // голоса нет ни в одном источнике: продолжаем слушать все — вдруг маршрут поменяют прямо во время звонка
+    if (decideTries === 1) {
+      sendLog("голос собеседника не найден ни в одном источнике");
+      cyberSubsStatus("Голос собеседника не слышен плагину. Направь звук Discord в шину записи (в Voicemeeter — кнопка B2 на полосе Discord)", 30000);
+    }
+    remoteSources.forEach(s => { s.on = s.onN = s.off = s.offN = 0; });
+    return;
+  }
+
+  activeSource = best.s;
   sourceDecided = true;
   try { localStorage.setItem(SRC_KEY, activeSource.label); } catch {}
-  sendLog("источник голоса собеседника: " + activeSource.label + " | "
-    + scored.map(x => x.s.label + " речь=" + x.on.toFixed(3) + " пауза=" + x.off.toFixed(3)).join("; "));
+  sendLog("источник голоса собеседника: " + shortLabel(activeSource.label));
+  if (decideTries > 1) cyberSubsStatus("Голос собеседника найден: " + shortLabel(activeSource.label), 4000);
   remoteSources.filter(s => s !== activeSource).forEach(dropSource);
   remoteSources = [activeSource];
 }
@@ -559,15 +575,14 @@ button:active{transform:translateY(1px)}
 .mode-talk .timer{margin-left:auto;color:#f4f7fa;letter-spacing:.12em}
 .mode-talk .ava .lines,.mode-talk .ava .gr,.mode-talk .ava .gc,.mode-talk .ava .slice,
 .mode-talk .name::before,.mode-talk .name::after{animation:none}
-.mode-talk .wave i{animation:none;transform:scaleY(.14);opacity:.4}
+.mode-talk .wave i{animation:none;transform:scaleY(.14);opacity:.4;transition:background-color .35s}
 .mode-talk .ava{transition:outline-color .15s, box-shadow .15s}
 .mode-talk .wrap.speaking .ava::after{border:3px solid var(--y)}
-.mode-talk .wrap.speaking .ava{animation:talk .62s ease-in-out infinite}
-.mode-talk .wrap.speaking .ava .base{animation:talkImg .62s ease-in-out infinite}
 .mode-talk .wrap.speaking .ava .gr{animation:splitR 1.4s steps(1) infinite}
 .mode-talk .wrap.speaking .ava .gc{animation:splitC 1.4s steps(1) infinite}
 .mode-talk .wrap.speaking .ava .lines{animation:roll 1s linear infinite}
-.mode-talk .wrap.speaking .wave i{animation:wave .9s ease-in-out infinite;opacity:.9;background:var(--y)}
+.mode-talk .wrap.speaking .wave i{background:var(--y)}
+.mode-talk .ava::after{transition:border-color .3s, border-width .3s}
 .mode-talk .wrap.speaking .name{text-shadow:0 0 14px rgb(var(--y-rgb) / .5)}
 .ghost{background:transparent;color:rgb(var(--c-rgb) / .85);outline:1px solid rgb(var(--c-rgb) / .5);outline-offset:-1px;padding:0 12px}
 @keyframes talk{0%,100%{transform:translateY(0) scale(1)}30%{transform:translateY(-3px) scale(1.035)}65%{transform:translateY(1px) scale(.99)}}
@@ -696,18 +711,65 @@ document.querySelectorAll("button").forEach(b =>
 
 // Разговор: собеседник говорит / сменился говорящий (в групповом звонке)
 let speaking = false, lastVoice = 0, spokeEver = false;
+/*
+ * Плавная волна в разговоре: громкость «огибающей» поднимается за ~0,1 с и спадает за ~0,5 с,
+ * а столбики бегут синусоидой. Анимация крутится только пока кто-то говорит или волна ещё не
+ * затихла, в тишине ничего не рисуется.
+ */
+const meters = [];
+function makeMeter(wrap) {
+  if (!wrap || !document.body.classList.contains("mode-talk")) return null;
+  const m = { bars: [...wrap.querySelectorAll(".wave i")], ava: wrap.querySelector(".ava"), env: 0, target: 0, t: Math.random() * 9 };
+  meters.push(m);
+  return m;
+}
+let meterRaf = 0, meterLast = 0;
+function meterFrame(now) {
+  const dt = Math.min(0.05, (now - (meterLast || now)) / 1000);
+  meterLast = now;
+  let busy = false;
+  for (const m of meters) {
+    const tau = m.target > m.env ? 0.09 : 0.45;
+    m.env += (m.target - m.env) * (1 - Math.exp(-dt / tau));
+    if (m.target === 0 && m.env < 0.004) m.env = 0;
+    if (m.env > 0 || m.target > 0) busy = true;
+    m.t += dt;
+    const e = m.env, n = m.bars.length;
+    m.bars.forEach((bar, i) => {
+      const wave = 0.5 + 0.5 * Math.sin(m.t * 7.5 - i * 0.62);
+      const wobble = 0.65 + 0.35 * Math.sin(m.t * 2.9 + i * 1.7);
+      const edge = Math.sin(Math.PI * (i + 0.5) / n); // по краям ниже, к середине выше
+      bar.style.transform = "scaleY(" + (0.14 + e * 0.86 * wave * wobble * (0.45 + 0.55 * edge)).toFixed(3) + ")";
+      bar.style.opacity = (0.4 + 0.5 * e).toFixed(3);
+    });
+    if (m.ava) {
+      const bob = Math.sin(m.t * 10.1);
+      m.ava.style.transform = e ? "translateY(" + (-3 * e * Math.abs(bob)).toFixed(2) + "px) scale(" + (1 + 0.03 * e * (0.5 + 0.5 * bob)).toFixed(4) + ")" : "";
+    }
+  }
+  meterRaf = busy ? requestAnimationFrame(meterFrame) : 0;
+  if (!busy) meterLast = 0;
+}
+function meterSet(m, on) {
+  if (!m) return;
+  m.target = on ? 1 : 0;
+  if (!meterRaf) meterRaf = requestAnimationFrame(meterFrame);
+}
+const otherMeter = makeMeter(document.getElementById("wOther"));
+
 window.cyberSpeak = on => {
   speaking = !!on;
   if (speaking) { lastVoice = Date.now(); spokeEver = true; }
   const w = document.getElementById("wOther");
   if (w) w.classList.toggle("speaking", speaking);
+  meterSet(otherMeter, speaking);
 };
 // Собеседник вышел из звонка или вернулся
 window.cyberGone = on => {
   const w = document.getElementById("wOther");
   if (!w) return;
   w.classList.toggle("gone", !!on);
-  if (on) { speaking = false; w.classList.remove("speaking"); }
+  if (on) { speaking = false; w.classList.remove("speaking"); meterSet(otherMeter, false); }
 };
 // Ctrl + колесо мыши над окном меняет его размер (считает и запоминает главный процесс)
 let wheelAt = 0;
@@ -734,14 +796,16 @@ window.cyberMineShow = (who, text, status, hold) => {
 // Моё окно: сигналы «я говорю» и «я выключил микрофон» от Discord
 const wMe = document.getElementById("wMe");
 let selfSpeaking = false, selfSpokeEver = false, selfMuted = false, onSelfMuted = null;
+const meMeter = makeMeter(wMe);
 window.cyberSelfSpeak = on => {
   selfSpeaking = !!on;
   if (selfSpeaking) selfSpokeEver = true;
   if (wMe) wMe.classList.toggle("speaking", selfSpeaking && !selfMuted);
+  meterSet(meMeter, selfSpeaking && !selfMuted);
 };
 window.cyberSelfMuted = on => {
   selfMuted = !!on;
-  if (wMe) { wMe.classList.toggle("muted", selfMuted); if (selfMuted) wMe.classList.remove("speaking"); }
+  if (wMe) { wMe.classList.toggle("muted", selfMuted); if (selfMuted) { wMe.classList.remove("speaking"); meterSet(meMeter, false); } }
   if (onSelfMuted) onSelfMuted(selfMuted);
 };
 window.cyberUser = (name, sub, avatar) => {

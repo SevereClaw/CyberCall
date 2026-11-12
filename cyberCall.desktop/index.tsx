@@ -291,6 +291,16 @@ const isSelfMuted = () => {
     }
 };
 
+/** Куда Discord выводит звук — помогает понять, где искать голос собеседника. */
+function outputDeviceName() {
+    try {
+        const id = MediaEngineStore.getOutputDeviceId();
+        return String((MediaEngineStore.getOutputDevices() as any)?.[id]?.name ?? id ?? "?");
+    } catch {
+        return "?";
+    }
+}
+
 /** Моё имя, аватарка и микрофон, выбранный в Discord, — для моего окна с субтитрами. */
 function selfInfo() {
     const me = UserStore.getCurrentUser();
@@ -317,6 +327,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     const s = settings.store;
     const ownRingtone = s.ringtoneVolume > 0 && (mode === "in" || (mode === "out" && s.ringtoneOutgoing));
     setRingMuted(ownRingtone && channelId !== TEST_ID && s.muteDiscordRing);
+    if (mode === "talk" && s.captions) log("вывод звука Discord: " + outputDeviceName());
     log(`показываю панель: ${mode}${channelId === TEST_ID ? " (тест)" : ""}, свой рингтон=${ownRingtone}, субтитры=${mode === "talk" && s.captions}`);
     Native.showCall({
         ...info,
