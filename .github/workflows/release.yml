@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     branches: [main]
-    paths-ignore: ["README.md", "docs/**"]
+    paths-ignore: ["README.md", "docs/**", "ci/**", ".github/workflows/stt-*.yml"]
   schedule:
     # раз в неделю пересобираем со свежим Vencord, чтобы не ломалось после обновлений Discord
     - cron: "0 3 * * 1"

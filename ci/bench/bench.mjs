@@ -46,8 +46,11 @@ const engines = [
     { name: "whisper-small", load: () => page.evaluate(() => loadWhisper("whisper-small", "wasm")), run: c => page.evaluate(([f, l]) => whisper(f, l), [c.file, c.lang]) }
 ];
 
+const only = process.env.ENGINES ? process.env.ENGINES.split(",") : null;
+const maxWer = Number(process.env.MAX_WER || 0);
+let failed = false;
 const summary = [];
-for (const e of engines) {
+for (const e of engines.filter(x => !only || only.includes(x.name))) {
     const loadMs = e.load ? await e.load() : 0;
     const acc = { ru: { errors: 0, words: 0, ms: 0, sec: 0 }, en: { errors: 0, words: 0, ms: 0, sec: 0 } };
     for (const c of clips) {
@@ -60,9 +63,11 @@ for (const e of engines) {
     }
     for (const lang of ["ru", "en"]) {
         const a = acc[lang];
+        if (maxWer && a.words && a.errors / a.words * 100 > maxWer) failed = true;
         summary.push(`${e.name.padEnd(14)} ${lang}: WER ${(a.errors / a.words * 100).toFixed(1)}%  скорость ${(a.ms / 1000 / a.sec).toFixed(2)}x от длины речи  загрузка ${loadMs} ms`);
     }
 }
 console.log("\n===== ИТОГ =====\n" + summary.join("\n"));
 await browser.close();
 server.close();
+if (failed) { console.log("WER выше допустимого " + maxWer + "%"); process.exit(1); }

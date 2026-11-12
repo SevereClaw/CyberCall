@@ -1,0 +1,99 @@
+name: STT Whisper assets
+
+# Служебный релиз с файлами точного распознавания (Whisper small, ONNX, 8 бит) и его движком.
+# Плагин скачивает их сам, когда включена высокая точность субтитров. Перед публикацией модель
+# проверяется в настоящем браузере на реальной речи (FLEURS). Если релиз уже есть, ничего не делает.
+
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/stt-whisper.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAG: stt-whisper-1
+  TRANSFORMERS: 4.3.2
+  MODEL: onnx-community/whisper-small
+  MODEL_REV: main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Skip if already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Collect files
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          W=$PWD/work; mkdir -p $W/tf $W/ort
+          cp ci/bench/page.html $W/
+          npm pack @huggingface/transformers@$TRANSFORMERS >/dev/null && tar xzf huggingface-transformers-$TRANSFORMERS.tgz
+          cp package/dist/transformers.min.js $W/tf/
+          ORT=$(node -p "require('./package/package.json').dependencies['onnxruntime-web']")
+          rm -rf package && npm pack onnxruntime-web@$ORT >/dev/null && tar xzf onnxruntime-web-*.tgz
+          cp package/dist/ort-wasm-simd-threaded.asyncify.mjs package/dist/ort-wasm-simd-threaded.asyncify.wasm $W/ort/
+          rm -rf package && npm pack vosk-browser@0.0.8 >/dev/null && tar xzf vosk-browser-0.0.8.tgz && cp package/dist/vosk.js $W/
+          curl -sL --fail -o $W/model-ru.tar.gz https://github.com/${{ github.repository }}/releases/download/stt-2/model-ru.tar.gz
+          curl -sL --fail -o $W/model-en.tar.gz https://github.com/${{ github.repository }}/releases/download/stt-2/model-en.tar.gz
+          pip install -q huggingface_hub
+          python ci/bench/prepare.py $W 6
+          echo "ORT=$ORT" >> $GITHUB_ENV
+
+      - name: Test in a real browser
+        if: steps.check.outputs.exists != 'true'
+        env:
+          ENGINES: whisper-small
+          MAX_WER: 25
+        run: |
+          npm install --no-save playwright@1
+          npx playwright install --with-deps chromium
+          node ci/bench/bench.mjs $PWD/work
+
+      - name: Publish
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          W=$PWD/work; P=$PWD/publish; mkdir -p $P
+          M=$W/models/$MODEL
+          # плоские имена для релиза; manifest.json сопоставляет их с путями, которые запрашивает движок
+          node - "$W" "$M" "$P" <<'NODE'
+          const [W, M, P] = process.argv.slice(2);
+          const fs = require("fs"), path = require("path"), crypto = require("crypto");
+          const files = [];
+          const add = (src, served) => {
+            const remote = "w-" + served.replace(/^\//, "").replace(/\//g, "-");
+            fs.copyFileSync(src, path.join(P, remote));
+            const data = fs.readFileSync(src);
+            files.push({ path: served, remote, size: data.length, sha256: crypto.createHash("sha256").update(data).digest("hex") });
+          };
+          add(path.join(W, "tf/transformers.min.js"), "/tf/transformers.min.js");
+          for (const f of fs.readdirSync(path.join(W, "ort"))) add(path.join(W, "ort", f), "/ort/" + f);
+          const walk = d => fs.readdirSync(d).flatMap(f => fs.statSync(path.join(d, f)).isDirectory() ? walk(path.join(d, f)) : [path.join(d, f)]);
+          for (const f of walk(M)) if (!f.includes("/.cache/")) add(f, "/models/whisper/" + path.relative(M, f));
+          fs.writeFileSync(path.join(P, "manifest.json"), JSON.stringify({ model: process.env.MODEL, transformers: process.env.TRANSFORMERS, ort: process.env.ORT, files }, null, 1));
+          NODE
+          cat $P/manifest.json
+          sha256sum $P/manifest.json
+          cat > notes.md <<NOTES
+          Служебный релиз для режима «высокая точность» субтитров. Плагин скачивает эти файлы сам.
+
+          - Модель: [$MODEL](https://huggingface.co/$MODEL) — OpenAI Whisper small в формате ONNX, 8 бит (MIT)
+          - Движок: [@huggingface/transformers](https://github.com/huggingface/transformers.js) $TRANSFORMERS (Apache-2.0) и onnxruntime-web $ORT (MIT)
+          - manifest.json — список файлов с размерами и SHA-256
+          NOTES
+          gh release create "$TAG" $P/* -R "$GITHUB_REPOSITORY" --title "Файлы точного распознавания (Whisper small)" --notes-file notes.md --latest=false
