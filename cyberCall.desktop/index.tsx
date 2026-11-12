@@ -65,7 +65,7 @@ async function copyJournal() {
     const s = settings.store;
     const head = [
         "CyberCall " + await Native.getVersion().catch(() => "?"),
-        `настройки: субтитры=${s.captions}/${s.subtitleLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
+        `настройки: субтитры=${s.captions}/${s.captionLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
         ringMuterReport(),
         `события речи от Discord: ${speakEvents}, сейчас говорят: ${speakers.size}`
     ];
@@ -217,12 +217,13 @@ const settings = definePluginSettings({
         description: "Моё окно: во время разговора рядом с панелью собеседника такая же панель с моим ником и аватаркой. Оживает, когда говорю я; с включёнными субтитрами показывает и мою речь",
         default: true
     },
-    subtitleLang: {
+    captionLang: {
         type: OptionType.SELECT,
-        description: "Язык субтитров (распознаётся один язык за раз)",
+        description: "Язык субтитров. «Оба» сам выбирает язык каждой фразы, но занимает вдвое больше памяти (около 800 МБ во время звонка)",
         options: [
-            { label: "Русский", value: "ru", default: true },
-            { label: "English", value: "en" }
+            { label: "Русский + English (оба сразу)", value: "both", default: true },
+            { label: "Только русский", value: "ru" },
+            { label: "Только English", value: "en" }
         ]
     },
     autoUpdate: {
@@ -351,7 +352,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         mePosX: s.mePosX,
         mePosY: s.mePosY,
         ...selfInfo(),
-        subtitleLang: s.subtitleLang as string,
+        subtitleLang: s.captionLang as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
         ringtoneOutgoing: s.ringtoneOutgoing

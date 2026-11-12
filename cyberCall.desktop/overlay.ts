@@ -91,7 +91,7 @@ export function resolveTheme(theme?: string, accent?: string): Theme {
 const PANEL = { compact: { width: 520, height: 176 }, big: { width: 320, height: 470 } };
 const PAD = 14, GAP = 8;
 /** высота строки субтитров под панелью */
-const SUBS_HEIGHT = { compact: 66, big: 104 };
+const SUBS_HEIGHT = { compact: 74, big: 118 };
 
 export function clampScale(scale: number) {
     return Math.min(2, Math.max(0.5, Number(scale) || 1));
@@ -136,47 +136,112 @@ const caption = (text, final) => {
   if (!text) return;
   whoEl.textContent = document.getElementById("name").textContent;
   txtEl.textContent = text;
-  subsEl.className = "subs on";
+  subsEl.className = "subs on" + (final ? "" : " partial");
   subsHideIn(final ? 6000 : 10000);
 };
 // мои слова уходят в моё окно (его показывает главный процесс)
-const mineShow = (who, text, status, hold) => {
-  document.title = "cybercall:mine:" + encodeURIComponent(JSON.stringify([who, text, !!status, hold || 0])) + ":" + Date.now();
+const mineShow = (who, text, status, hold, partial) => {
+  document.title = "cybercall:mine:" + encodeURIComponent(JSON.stringify([who, text, !!status, hold || 0, !!partial])) + ":" + Date.now();
 };
 const mineCaption = (text, final) => {
   text = nice(text);
-  if (text) mineShow("@", text, false, final ? 6000 : 10000);
+  if (text) mineShow("@", text, false, final ? 6000 : 10000, !final);
 };
 const mineStatus = (text, hold) => mineShow("", text, true, hold);
 onSelfMuted = muted => { if (muted) mineStatus("Микрофон выключен — твоя речь не распознаётся", 4000); };
 
-let sttModel = null;
+let sttModels = [];
 window.cyberSubsInit = async cfg => {
   await new Promise((ok, fail) => {
     const s = document.createElement("script");
     s.src = cfg.engineUrl; s.onload = ok; s.onerror = () => fail(new Error("движок не загрузился"));
     document.head.appendChild(s);
   });
+  const list = cfg.models || [{ lang: "ru", url: cfg.modelUrl }];
   // если модель не поднялась, движок может молчать вечно — поэтому ждём не дольше двух минут
-  sttModel = await Promise.race([
-    Vosk.createModel(cfg.modelUrl, -1),
+  sttModels = await Promise.race([
+    Promise.all(list.map(async m => ({ lang: m.lang, model: await Vosk.createModel(m.url, -1) }))),
     new Promise((_, fail) => setTimeout(() => fail(new Error("модель не загрузилась")), 120000))
   ]);
 };
 
 /*
- * Один слушатель = один поток звука со своим распознавателем.
+ * Фразы с низкой уверенностью распознавателя — чаще всего шум, игра или чужой язык.
+ * Их не показываем. Если включены оба языка, одну и ту же фразу распознают обе модели,
+ * и показывается вариант той, что уверена сильнее.
+ */
+const MIN_CONF = 0.45;
+const confOf = r => {
+  const words = r.result || [];
+  return words.length ? words.reduce((a, w) => a + w.conf, 0) / words.length : 0;
+};
+
+/*
+ * Один слушатель = один поток звука со своими распознавателями (по одному на язык).
  * signal() возвращает { on, ever, blocked }: говорит ли человек по данным Discord, приходил ли
  * этот сигнал хоть раз, и запрещено ли слушать (микрофон выключен). Если Discord сигнал ни разу
  * не прислал, ориентируемся на громкость.
  */
 function makeListener(signal, show, stats) {
-  let rec = null, recRate = 0, wasOpen = false, lastFlag = 0, lastSound = 0;
+  let recs = [], recRate = 0, wasOpen = false, lastFlag = 0, lastSound = 0;
   // Сигнал «говорит» приходит с опозданием, и без запаса распознаватель теряет начало фразы.
   // Поэтому держим последние ~0,7 с звука и отдаём их, когда сигнал появился.
   let preroll = [], prerollLen = 0;
+  /*
+   * Выбор языка (если моделей две). Обе модели слушают одну и ту же реплику — от начала речи
+   * до паузы. Пока реплика идёт, показываем текст модели, которая выигрывала в прошлый раз.
+   * Когда реплика закончилась, сравниваем среднюю уверенность моделей по всем словам реплики;
+   * если победила другая модель, заменяем текст на её вариант.
+   */
+  let favored = null, seg = null, segTimer = 0;
+  const lead = () => favored || recs[0].lang;
+  const newSeg = () => ({ by: {} });
+  const segAdd = (lang, r) => {
+    const s = seg.by[lang] = seg.by[lang] || { texts: [], conf: 0, words: 0 };
+    const words = r.result || [];
+    if (r.text) s.texts.push(r.text);
+    s.conf += words.reduce((a, w) => a + w.conf, 0);
+    s.words += words.length;
+  };
+  const closeSeg = () => {
+    clearTimeout(segTimer);
+    const done = seg; seg = null;
+    if (!done || recs.length < 2) return;
+    const scored = Object.entries(done.by).filter(([, s]) => s.words)
+      .map(([lang, s]) => ({ lang, text: s.texts.join(" "), conf: s.conf / s.words + (lang === lead() ? 0.05 : 0) }))
+      .sort((a, b) => b.conf - a.conf);
+    const best = scored[0];
+    if (!best) return;
+    stats.langs[best.lang] = (stats.langs[best.lang] || 0) + 1;
+    if (best.lang !== lead()) {
+      favored = best.lang;
+      if (best.conf >= MIN_CONF) show(best.text, true);
+    }
+  };
+
+  const onFinal = (lang, r) => {
+    stats.loudSinceText = 0;
+    if (recs.length > 1) {
+      if (!seg) seg = newSeg();
+      segAdd(lang, r);
+      if (lang !== lead()) return;
+    }
+    if (!r.text) return;
+    if (confOf(r) < MIN_CONF) { stats.dropped++; return; }
+    stats.finals++;
+    show(r.text, true);
+  };
+
+  const onPartial = (lang, text) => {
+    if (!text) return;
+    stats.partials++; stats.loudSinceText = 0;
+    if (lang === lead()) show(text, false);
+  };
+
+  const feedAll = (data, rate) => { for (const r of recs) r.rec.acceptWaveformFloat(data, rate); };
+
   return (samples, rate) => {
-    if (!sttModel) return;
+    if (!sttModels.length) return;
     const now = Date.now(), sig = signal();
     if (sig.on) lastFlag = now;
     let sum = 0;
@@ -188,7 +253,12 @@ function makeListener(signal, show, stats) {
     const open = !sig.blocked && (now - lastFlag <= 800 || (!sig.ever && now - lastSound <= 800));
     if (!open) {
       // человек замолчал: дописываем тишину, чтобы распознаватель закончил фразу
-      if (wasOpen && rec) rec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
+      if (wasOpen && recs.length) {
+        feedAll(new Float32Array(Math.round(rate)), rate);
+        // поздние результаты моделей ещё в пути — подводим итог реплики чуть позже
+        clearTimeout(segTimer);
+        segTimer = setTimeout(closeSeg, 1500);
+      }
       wasOpen = false;
       if (!sig.blocked) {
         preroll.push(samples); prerollLen += samples.length;
@@ -196,14 +266,23 @@ function makeListener(signal, show, stats) {
       }
       return;
     }
-    if (!rec || recRate !== rate) {
-      if (rec) rec.remove();
-      rec = new sttModel.KaldiRecognizer(rate); recRate = rate;
-      rec.on("partialresult", m => { if (m.result.partial) { stats.partials++; stats.loudSinceText = 0; } show(m.result.partial, false); });
-      rec.on("result", m => { if (m.result.text) { stats.finals++; stats.loudSinceText = 0; } show(m.result.text, true); });
+    if (!recs.length || recRate !== rate) {
+      recs.forEach(r => r.rec.remove());
+      recRate = rate;
+      recs = sttModels.map(({ lang, model }) => {
+        const rec = new model.KaldiRecognizer(rate);
+        try { rec.setWords(true); } catch {}
+        rec.on("partialresult", m => onPartial(lang, m.result.partial));
+        rec.on("result", m => onFinal(lang, m.result));
+        return { lang, rec };
+      });
+    }
+    if (!wasOpen) {
+      if (seg) closeSeg();
+      seg = newSeg();
     }
     if (!wasOpen && preroll.length) {
-      for (const p of preroll) rec.acceptWaveformFloat(p, rate);
+      for (const p of preroll) feedAll(p, rate);
       stats.prerolls = (stats.prerolls || 0) + 1;
     }
     preroll = []; prerollLen = 0;
@@ -214,15 +293,15 @@ function makeListener(signal, show, stats) {
     if (level > 0.02) stats.loudSinceText++;
     if (stats.loudSinceText > 240) {
       stats.loudSinceText = 0; stats.restarts++;
-      rec.remove(); rec = null; wasOpen = false;
+      recs.forEach(r => r.rec.remove()); recs = []; wasOpen = false;
       return;
     }
-    rec.acceptWaveformFloat(samples, rate);
+    feedAll(samples, rate);
   };
 }
 
 // счётчики для журнала: по ним видно, где обрывается цепочка «звук → распознавание → текст»
-const newStats = () => ({ blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0, lvlSum: 0, lvlN: 0, loudSinceText: 0, restarts: 0 });
+const newStats = () => ({ blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0, lvlSum: 0, lvlN: 0, loudSinceText: 0, restarts: 0, dropped: 0, langs: {} });
 const sttStats = newStats(), mineStats = newStats();
 window.cyberSubsFeed = makeListener(() => ({ on: speaking, ever: spokeEver, blocked: false }), caption, sttStats);
 window.cyberMineFeed = makeListener(() => ({ on: selfSpeaking, ever: selfSpokeEver, blocked: selfMuted }), mineCaption, mineStats);
@@ -233,7 +312,9 @@ const statLine = (title, st, ever) => {
   const lvl = st.lvlN ? (st.lvlSum / st.lvlN).toFixed(3) : "—";
   st.lvlSum = 0; st.lvlN = 0;
   return title + ": распознавалось=" + st.fed + "/" + st.blocks + " громкость речи=" + lvl + " сигнал Discord=" + ever
-    + " текст=" + st.partials + "/" + st.finals + (st.restarts ? " перезапусков=" + st.restarts : "");
+    + " текст=" + st.partials + "/" + st.finals + (st.dropped ? " отброшено=" + st.dropped : "")
+    + (Object.keys(st.langs).length ? " языки=" + Object.entries(st.langs).map(([l, n]) => l + ":" + n).join(",") : "")
+    + (st.restarts ? " перезапусков=" + st.restarts : "");
 };
 setInterval(() => {
   const line = statLine("звук", sttStats, spokeEver) + (mineStats.blocks ? " | " + statLine("микрофон", mineStats, selfSpokeEver) : "");
@@ -609,12 +690,15 @@ button:active{transform:translateY(1px)}
 /* ---------- субтитры ---------- */
 .subs{flex:none;width:520px;height:${SUBS_HEIGHT.compact}px;padding:6px 12px 7px;overflow:hidden;
   display:flex;flex-direction:column;justify-content:flex-end;
-  background:rgba(8,10,14,.84);border-left:3px solid var(--y);
-  font-size:15px;line-height:18px;font-weight:600;color:#f4f7fa;text-shadow:0 1px 2px #000;
+  background:rgba(4,6,9,.94);border-left:3px solid var(--y);
+  font-size:17px;line-height:21px;font-weight:700;color:#fff;letter-spacing:.01em;
+  text-shadow:0 0 2px #000,0 1px 2px #000;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
   opacity:0;transition:opacity .35s}
+.subs .txt{transition:color .2s}
+.subs.partial .txt{color:#c4ccd4}
 .big .subs{width:320px;height:${SUBS_HEIGHT.big}px}
 .subs.on{opacity:1}
-.subs .who{color:var(--y);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-right:7px}
+.subs .who{color:var(--y);font-weight:800;font-size:14px;letter-spacing:.06em;text-transform:uppercase;margin-right:8px}
 .subs.status{font-size:12px;letter-spacing:.08em;font-weight:400;color:rgb(var(--c-rgb) / .9);border-left-color:var(--c)}
 body.out .subs{opacity:0;transition:opacity .12s}
 
@@ -802,12 +886,12 @@ window.addEventListener("wheel", e => {
 window.cyberZoom = scale => { document.body.style.zoom = scale; };
 // Моё окно: текст моей речи приходит из окна звонка, где работает распознавание
 let myCapTimer = 0;
-window.cyberMineShow = (who, text, status, hold) => {
+window.cyberMineShow = (who, text, status, hold, partial) => {
   const el = document.getElementById("mine");
   if (!el) return;
   el.querySelector(".who").textContent = who === "@" ? document.getElementById("myName").textContent : who;
   el.querySelector(".txt").textContent = text;
-  el.className = "subs" + (text ? " on" : "") + (status ? " status" : "");
+  el.className = "subs" + (text ? " on" : "") + (status ? " status" : "") + (partial ? " partial" : "");
   clearTimeout(myCapTimer);
   if (hold) myCapTimer = setTimeout(() => el.classList.remove("on"), hold);
 };

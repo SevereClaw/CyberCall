@@ -42,7 +42,8 @@ const MODELS: Record<string, Asset> = {
     }
 };
 
-export const sttLang = (lang: string) => (lang === "en" ? "en" : "ru");
+/** Какие модели нужны: «both» — русская и английская сразу. */
+export const sttLangs = (lang: string) => (lang === "both" ? ["ru", "en"] : [lang === "en" ? "en" : "ru"]);
 const dir = () => join(app.getPath("userData"), "CyberCall", "stt");
 
 const downloads = new Map<string, Promise<string>>();
@@ -107,14 +108,24 @@ function ensure(asset: Asset, onProgress: (percent: number) => void) {
     return p;
 }
 
-/** Скачивает движок и модель языка, если их ещё нет. Возвращает пути к файлам. */
-export async function prepareStt(lang: string, onStatus: (text: string) => void) {
-    const model = MODELS[sttLang(lang)];
+export interface SttFiles { engine: string; models: Record<string, string>; }
+
+/** Скачивает движок и модели языков, если их ещё нет. Возвращает пути к файлам. */
+export async function prepareStt(lang: string, onStatus: (text: string) => void): Promise<SttFiles> {
+    const langs = sttLangs(lang);
+    const parts = [ENGINE, ...langs.map(l => MODELS[l])];
+    const total = parts.reduce((a, p) => a + p.size, 0);
+    let before = 0;
     onStatus("Подготовка распознавания речи…");
-    const engine = await ensure(ENGINE, p => onStatus(`Загрузка распознавания речи… ${Math.round(p / 8)}%`));
-    const modelPath = await ensure(model, p => onStatus(`Загрузка распознавания речи… ${12 + Math.round(p * 0.88)}%`));
+
+    const paths: string[] = [];
+    for (const asset of parts) {
+        const start = before;
+        paths.push(await ensure(asset, p => onStatus(`Загрузка распознавания речи… ${Math.round((start + asset.size * p / 100) / total * 100)}%`)));
+        before += asset.size;
+    }
     for (const old of OLD_FILES) await unlink(join(dir(), old)).catch(() => { });
-    return { engine, model: modelPath };
+    return { engine: paths[0], models: Object.fromEntries(langs.map((l, i) => [l, paths[i + 1]])) };
 }
 
 let sessionReady = false;
@@ -141,10 +152,11 @@ export interface SttServer {
     /** адрес страницы оверлея */
     pageUrl: string;
     engineUrl: string;
-    modelUrl: string;
+    /** адреса моделей по языкам */
+    modelUrls: Record<string, string>;
     /** false — порт занят, работаем на случайном и кэш модели между звонками не сохранится */
     stablePort: boolean;
-    setFiles(files: { engine: string; model: string; }): void;
+    setFiles(files: SttFiles): void;
     close(): void;
 }
 
@@ -160,8 +172,8 @@ function listen(server: Server, port: number) {
 
 /** Локальный сервер только для своего окна: страница оверлея, движок и модель. */
 export async function startSttServer(lang: string, token: string, getHtml: () => string): Promise<SttServer> {
-    let files: { engine: string; model: string; } | null = null;
-    const modelName = "/" + MODELS[sttLang(lang)].file;
+    let files: SttFiles | null = null;
+    const names = Object.fromEntries(sttLangs(lang).map(l => ["/" + MODELS[l].file, l]));
 
     const server = createServer((req, res) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
@@ -179,7 +191,7 @@ export async function startSttServer(lang: string, token: string, getHtml: () =>
             return;
         }
 
-        const file = url.pathname === "/vosk.js" ? files?.engine : url.pathname === modelName ? files?.model : null;
+        const file = url.pathname === "/vosk.js" ? files?.engine : names[url.pathname] ? files?.models[names[url.pathname]] : null;
         if (!file) {
             res.writeHead(404).end();
             return;
@@ -203,7 +215,7 @@ export async function startSttServer(lang: string, token: string, getHtml: () =>
     return {
         pageUrl: `${origin}/overlay?t=${token}`,
         engineUrl: `${origin}/vosk.js`,
-        modelUrl: origin + modelName,
+        modelUrls: Object.fromEntries(Object.entries(names).map(([path, l]) => [l, origin + path])),
         stablePort,
         setFiles: f => { files = f; },
         close: () => {

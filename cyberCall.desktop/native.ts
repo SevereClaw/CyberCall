@@ -12,7 +12,7 @@ import { extname, join } from "path";
 import defaultRingtone from "file://ringtone.mp3?base64";
 
 import { buildOverlayHtml, clampScale, CLOSE_MS, overlaySize } from "./overlay";
-import { prepareStt, startSttServer, STT_PARTITION, sttLang, SttServer, sttSession } from "./stt";
+import { prepareStt, startSttServer, STT_PARTITION, sttLangs, SttServer, sttSession } from "./stt";
 import { RELEASE_URL, runUpdate } from "./updater";
 
 export interface ShowOptions {
@@ -201,9 +201,9 @@ function createWindow(bounds: { x: number; y: number; width: number; height: num
         if (title.startsWith("cybercall:mine:")) {
             // текст моей речи из окна звонка — в моё окно
             try {
-                const [who, text, status, hold] = JSON.parse(decodeURIComponent(title.slice(15).replace(/:\d+$/, "")));
+                const [who, text, status, hold, partial] = JSON.parse(decodeURIComponent(title.slice(15).replace(/:\d+$/, "")));
                 if (meWin && !meWin.isDestroyed())
-                    meWin.webContents.executeJavaScript(`cyberMineShow(${JSON.stringify(String(who))},${JSON.stringify(String(text))},${status ? "true" : "false"},${Number(hold) || 0})`).catch(() => { });
+                    meWin.webContents.executeJavaScript(`cyberMineShow(${JSON.stringify(String(who))},${JSON.stringify(String(text))},${status ? "true" : "false"},${Number(hold) || 0},${partial ? "true" : "false"})`).catch(() => { });
             } catch { }
             return;
         }
@@ -403,12 +403,12 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
     if (!server) return status("Субтитры не запустились: не удалось открыть локальную страницу", 20000);
 
     status("Подготовка распознавания речи…");
-    prepareStt(sttLang(lang), text => status(text))
+    prepareStt(lang, text => status(text))
         .then(files => {
-            log("субтитры: файлы готовы, запускаю распознавание (" + sttLang(lang) + ")");
+            log("субтитры: файлы готовы, запускаю распознавание (" + sttLangs(lang).join(" + ") + ")");
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
-            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, own, micLabel, outputLabel })})`, true);
+            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, models: Object.entries(server.modelUrls).map(([lang, url]) => ({ lang, url })), own, micLabel, outputLabel })})`, true);
         })
         .catch(e => {
             const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);
