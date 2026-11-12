@@ -200,27 +200,40 @@ function makeListener(signal, show, stats) {
     if (!rec || recRate !== rate) {
       if (rec) rec.remove();
       rec = new sttModel.KaldiRecognizer(rate); recRate = rate;
-      rec.on("partialresult", m => { if (m.result.partial) stats.partials++; show(m.result.partial, false); });
-      rec.on("result", m => { if (m.result.text) stats.finals++; show(m.result.text, true); });
+      rec.on("partialresult", m => { if (m.result.partial) { stats.partials++; stats.loudSinceText = 0; } show(m.result.partial, false); });
+      rec.on("result", m => { if (m.result.text) { stats.finals++; stats.loudSinceText = 0; } show(m.result.text, true); });
     }
     wasOpen = true;
     stats.fed++;
+    stats.lvlSum += level; stats.lvlN++;
+    // сторож: речь слышна давно, а распознаватель молчит — пересоздаём его
+    if (level > 0.02) stats.loudSinceText++;
+    if (stats.loudSinceText > 240) {
+      stats.loudSinceText = 0; stats.restarts++;
+      rec.remove(); rec = null; wasOpen = false;
+      return;
+    }
     rec.acceptWaveformFloat(samples, rate);
   };
 }
 
 // счётчики для журнала: по ним видно, где обрывается цепочка «звук → распознавание → текст»
-const newStats = () => ({ blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0 });
+const newStats = () => ({ blocks: 0, fed: 0, peak: 0, partials: 0, finals: 0, lvlSum: 0, lvlN: 0, loudSinceText: 0, restarts: 0 });
 const sttStats = newStats(), mineStats = newStats();
 window.cyberSubsFeed = makeListener(() => ({ on: speaking, ever: spokeEver, blocked: false }), caption, sttStats);
 window.cyberMineFeed = makeListener(() => ({ on: selfSpeaking, ever: selfSpokeEver, blocked: selfMuted }), mineCaption, mineStats);
 
 let sttLogged = "", sttLogs = 0;
-const statLine = (title, st, ever) => title + ": блоков=" + st.blocks + " распознавалось=" + st.fed + " пик=" + st.peak.toFixed(3)
-  + " речь по Discord=" + ever + " текст: черновых=" + st.partials + " готовых=" + st.finals;
+// «громкость речи» — средний уровень звука в те моменты, когда он шёл в распознавание, за последние 10 секунд
+const statLine = (title, st, ever) => {
+  const lvl = st.lvlN ? (st.lvlSum / st.lvlN).toFixed(3) : "—";
+  st.lvlSum = 0; st.lvlN = 0;
+  return title + ": распознавалось=" + st.fed + "/" + st.blocks + " громкость речи=" + lvl + " сигнал Discord=" + ever
+    + " текст=" + st.partials + "/" + st.finals + (st.restarts ? " перезапусков=" + st.restarts : "");
+};
 setInterval(() => {
   const line = statLine("звук", sttStats, spokeEver) + (mineStats.blocks ? " | " + statLine("микрофон", mineStats, selfSpokeEver) : "");
-  if (!sttStats.blocks || line === sttLogged || sttLogs >= 14) return;
+  if (!sttStats.blocks || line === sttLogged || sttLogs >= 18) return;
   sttLogged = line; sttLogs++;
   sendLog(line);
 }, 10000);
@@ -270,43 +283,129 @@ function pipe(ctx, stream, feed) {
     else mono.set(l);
     feed(mono, ctx.sampleRate);
   };
+  return [src, proc, mute];
+}
+
+const withTimeout = (promise, ms, text) => Promise.race([promise, new Promise((_, fail) => setTimeout(() => fail(new Error(text)), ms))]);
+const cleanLabel = label => String(label || "").replace(/^(Default|Communications|По умолчанию|Связь)\s*-\s*/i, "");
+
+/*
+ * Откуда брать голос собеседника. Обычно это «звук компьютера» — то, что играет устройство
+ * вывода по умолчанию. Но с виртуальным микшером (Voicemeeter и подобные) Discord может
+ * выводить звук в другое устройство, и тогда там тишина. Поэтому в начале звонка слушаем сразу
+ * несколько источников и оставляем тот, где громко именно тогда, когда Discord показывает,
+ * что собеседник говорит.
+ */
+const SRC_KEY = "cybercall-source";
+let remoteSources = [], activeSource = null, sourceDecided = false;
+
+function addSource(ctx, label, stream) {
+  const src = { label, stream, on: 0, onN: 0, off: 0, offN: 0, nodes: null };
+  src.nodes = pipe(ctx, stream, (mono, rate) => {
+    if (!sourceDecided) {
+      let sum = 0;
+      for (let i = 0; i < mono.length; i += 4) sum += mono[i] * mono[i];
+      const level = Math.sqrt(sum / (mono.length / 4));
+      if (speaking && !selfSpeaking) { src.on += level; src.onN++; }
+      else if (!speaking) { src.off += level; src.offN++; }
+    }
+    if (src === activeSource) cyberSubsFeed(mono, rate);
+  });
+  remoteSources.push(src);
+  return src;
+}
+
+function dropSource(src) {
+  src.stream.getTracks().forEach(t => t.stop());
+  src.nodes.forEach(n => { try { n.disconnect(); } catch {} });
+  src.nodes[1].onaudioprocess = null;
+}
+
+function decideSource() {
+  if (sourceDecided || !activeSource) return;
+  // ждём несколько секунд речи собеседника и несколько секунд пауз: источник, где одинаково
+  // громко и в речи, и в паузах (музыка, игра), — не голос
+  const onN = Math.max(...remoteSources.map(s => s.onN)), offN = Math.max(...remoteSources.map(s => s.offN));
+  if (onN < 45) return;
+  const longWait = onN >= 400; // собеседник говорит без пауз — решаем по тому, что есть
+  if (offN < 20 && !longWait) return;
+  const mean = (sum, n) => n ? sum / n : 0;
+  const scored = remoteSources.map(s => ({ s, on: mean(s.on, s.onN), off: mean(s.off, s.offN) }));
+  const cur = scored.find(x => x.s === activeSource);
+  const candidates = offN >= 20
+    ? scored.filter(x => x.on > 0.008 && x.on > x.off * 1.5)
+    : (cur.on < 0.004 ? scored.filter(x => x.on > 0.008) : []);
+  const best = candidates.sort((a, b) => (b.on - b.off) - (a.on - a.off))[0];
+  if (best && best.s !== activeSource && best.on - best.off > (cur.on - cur.off) * 2.5) activeSource = best.s;
+  sourceDecided = true;
+  try { localStorage.setItem(SRC_KEY, activeSource.label); } catch {}
+  sendLog("источник голоса собеседника: " + activeSource.label + " | "
+    + scored.map(x => x.s.label + " речь=" + x.on.toFixed(3) + " пауза=" + x.off.toFixed(3)).join("; "));
+  remoteSources.filter(s => s !== activeSource).forEach(dropSource);
+  remoteSources = [activeSource];
 }
 
 window.cyberSubsStart = async cfg => {
-  let ctx;
+  let ctx = null, micLabel = "";
   try {
     cyberSubsStatus("Запуск распознавания речи…");
     await cyberSubsInit(cfg);
-    const stream = await Promise.race([
-      captureSystemAudio(),
-      new Promise((_, fail) => setTimeout(() => fail(new Error("система не ответила на запрос звука")), 15000))
-    ]);
     ctx = new AudioContext();
-    pipe(ctx, stream, cyberSubsFeed);
-    if (ctx.state === "suspended") await ctx.resume();
-    cyberSubsStatus("Субтитры включены", 2500);
-    sendLog("субтитры включены, частота " + ctx.sampleRate);
   } catch (e) {
     const text = "Субтитры не запустились: " + (e && e.message || e);
     cyberSubsStatus(text, 20000);
     sendLog(text + (e && e.name ? " [" + e.name + "]" : ""));
+    return;
   }
 
-  if (!mineEl || !sttModel) return;
-  try {
-    const mic = await Promise.race([
-      captureMic(cfg.micLabel),
-      new Promise((_, fail) => setTimeout(() => fail(new Error("микрофон не ответил")), 15000))
-    ]);
-    ctx = ctx || new AudioContext();
-    pipe(ctx, mic, cyberMineFeed);
-    if (ctx.state === "suspended") await ctx.resume();
-    mineStatus("Твои субтитры включены", 2500);
-    sendLog("мои субтитры включены, микрофон: " + mic.getAudioTracks()[0].label);
-  } catch (e) {
-    mineStatus("Микрофон недоступен: " + (e && e.message || e), 20000);
-    sendLog("мои субтитры не запустились: " + (e && e.message || e) + (e && e.name ? " [" + e.name + "]" : ""));
+  // 1. Мой микрофон (заодно после этого система отдаёт названия устройств)
+  if (mineEl) {
+    try {
+      const mic = await withTimeout(captureMic(cfg.micLabel), 15000, "микрофон не ответил");
+      micLabel = cleanLabel(mic.getAudioTracks()[0].label);
+      pipe(ctx, mic, cyberMineFeed);
+      mineStatus("Твои субтитры включены", 2500);
+      sendLog("мои субтитры включены, микрофон: " + micLabel);
+    } catch (e) {
+      mineStatus("Микрофон недоступен: " + (e && e.message || e), 20000);
+      sendLog("мои субтитры не запустились: " + (e && e.message || e) + (e && e.name ? " [" + e.name + "]" : ""));
+    }
   }
+
+  // 2. Голос собеседника: звук компьютера и остальные устройства записи
+  let firstError = null;
+  try {
+    addSource(ctx, "звук компьютера", await withTimeout(captureSystemAudio(), 15000, "система не ответила на запрос звука"));
+  } catch (e) { firstError = e; sendLog("звук компьютера недоступен: " + (e && e.message || e) + (e && e.name ? " [" + e.name + "]" : "")); }
+  try {
+    const seen = new Set([micLabel]);
+    const inputs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications");
+    for (const d of inputs) {
+      const label = cleanLabel(d.label);
+      if (!label || seen.has(label) || remoteSources.length >= 10) continue;
+      seen.add(label);
+      try {
+        addSource(ctx, label, await withTimeout(navigator.mediaDevices.getUserMedia({
+          audio: { deviceId: { exact: d.deviceId }, echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+        }), 5000, "нет ответа"));
+      } catch {}
+    }
+  } catch {}
+
+  if (!remoteSources.length) {
+    const text = "Субтитры собеседника не запустились: " + (firstError && firstError.message || "нет источников звука");
+    cyberSubsStatus(text, 20000);
+    sendLog(text);
+    return;
+  }
+
+  let saved = null;
+  try { saved = localStorage.getItem(SRC_KEY); } catch {}
+  activeSource = remoteSources.find(s => s.label === saved) || remoteSources[0];
+  if (ctx.state === "suspended") await ctx.resume();
+  cyberSubsStatus("Субтитры включены", 2500);
+  sendLog("субтитры включены, частота " + ctx.sampleRate + ", слушаю: " + activeSource.label + ", всего источников: " + remoteSources.length);
+  const decider = setInterval(() => { decideSource(); if (sourceDecided) clearInterval(decider); }, 2000);
 };
 `;
 
