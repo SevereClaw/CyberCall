@@ -15,21 +15,26 @@ import { createServer, Server } from "http";
 import { AddressInfo } from "net";
 import { join } from "path";
 
-const ASSET_URL = "https://github.com/SevereClaw/CyberCall/releases/download/stt-1/";
+const ASSET_URL = "https://github.com/SevereClaw/CyberCall/releases/download/stt-2/";
 /** Постоянный порт нужен, чтобы распакованная модель кэшировалась между звонками. */
 const PREFERRED_PORT = 47613;
 export const STT_PARTITION = "persist:cybercall-stt";
 
-interface Asset { file: string; size: number; sha256: string; type: string; }
+/** file — имя на диске и в адресе локального сервера, remote — имя в релизе (если отличается) */
+interface Asset { file: string; remote?: string; size: number; sha256: string; type: string; }
+
+/** Модели прошлых версий: удаляются после загрузки новой, чтобы не занимать место. */
+const OLD_FILES = ["model-ru.tar.gz"];
 
 const ENGINE: Asset = {
     file: "vosk.js", size: 5804767, type: "text/javascript",
     sha256: "29504515526e974f4cb053cf08811c4de5fb2a74007c0a5a957db50eaa8d5d0c"
 };
 const MODELS: Record<string, Asset> = {
+    // Новая модель лежит под другим именем: старую распакованную копию из кэша движка она не подхватит
     ru: {
-        file: "model-ru.tar.gz", size: 40810065, type: "application/gzip",
-        sha256: "b855cf79a513023af4090739caa407203754d7db98ccb3b8d4162f5d7f6a3f8e"
+        file: "model-ru-0.22.tar.gz", remote: "model-ru.tar.gz", size: 46235631, type: "application/gzip",
+        sha256: "8e757a6ad1f9f1fde2e6155d783301d37dd2a10adbe53b9940d7ef8a560f3d57"
     },
     en: {
         file: "model-en.tar.gz", size: 41184862, type: "application/gzip",
@@ -60,7 +65,7 @@ async function download(asset: Asset, onProgress: (percent: number) => void) {
         };
         alive();
         onProgress(0);
-        const res = await net.fetch(ASSET_URL + asset.file, { signal: abort.signal }).catch(e => {
+        const res = await net.fetch(ASSET_URL + (asset.remote ?? asset.file), { signal: abort.signal }).catch(e => {
             throw new Error(abort.signal.aborted ? "GitHub не отвечает (проверь интернет или VPN)" : String(e?.message ?? e));
         });
         if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
@@ -108,6 +113,7 @@ export async function prepareStt(lang: string, onStatus: (text: string) => void)
     onStatus("Подготовка распознавания речи…");
     const engine = await ensure(ENGINE, p => onStatus(`Загрузка распознавания речи… ${Math.round(p / 8)}%`));
     const modelPath = await ensure(model, p => onStatus(`Загрузка распознавания речи… ${12 + Math.round(p * 0.88)}%`));
+    for (const old of OLD_FILES) await unlink(join(dir(), old)).catch(() => { });
     return { engine, model: modelPath };
 }
 

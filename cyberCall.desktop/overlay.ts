@@ -172,6 +172,9 @@ window.cyberSubsInit = async cfg => {
  */
 function makeListener(signal, show, stats) {
   let rec = null, recRate = 0, wasOpen = false, lastFlag = 0, lastSound = 0;
+  // Сигнал «говорит» приходит с опозданием, и без запаса распознаватель теряет начало фразы.
+  // Поэтому держим последние ~0,7 с звука и отдаём их, когда сигнал появился.
+  let preroll = [], prerollLen = 0;
   return (samples, rate) => {
     if (!sttModel) return;
     const now = Date.now(), sig = signal();
@@ -187,6 +190,10 @@ function makeListener(signal, show, stats) {
       // человек замолчал: дописываем тишину, чтобы распознаватель закончил фразу
       if (wasOpen && rec) rec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
       wasOpen = false;
+      if (!sig.blocked) {
+        preroll.push(samples); prerollLen += samples.length;
+        while (preroll.length > 1 && prerollLen - preroll[0].length >= rate * 0.7) prerollLen -= preroll.shift().length;
+      }
       return;
     }
     if (!rec || recRate !== rate) {
@@ -195,6 +202,11 @@ function makeListener(signal, show, stats) {
       rec.on("partialresult", m => { if (m.result.partial) { stats.partials++; stats.loudSinceText = 0; } show(m.result.partial, false); });
       rec.on("result", m => { if (m.result.text) { stats.finals++; stats.loudSinceText = 0; } show(m.result.text, true); });
     }
+    if (!wasOpen && preroll.length) {
+      for (const p of preroll) rec.acceptWaveformFloat(p, rate);
+      stats.prerolls = (stats.prerolls || 0) + 1;
+    }
+    preroll = []; prerollLen = 0;
     wasOpen = true;
     stats.fed++;
     stats.lvlSum += level; stats.lvlN++;
