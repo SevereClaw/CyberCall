@@ -10,10 +10,10 @@
 import { createHash } from "crypto";
 import { app, desktopCapturer, net, session } from "electron";
 import { createReadStream, createWriteStream } from "fs";
-import { mkdir, rename, stat, unlink } from "fs/promises";
+import { mkdir, readFile, rename, stat, unlink } from "fs/promises";
 import { createServer, Server } from "http";
 import { AddressInfo } from "net";
-import { join } from "path";
+import { extname, join } from "path";
 
 const ASSET_URL = "https://github.com/SevereClaw/CyberCall/releases/download/stt-2/";
 /** Постоянный порт нужен, чтобы распакованная модель кэшировалась между звонками. */
@@ -21,7 +21,7 @@ const PREFERRED_PORT = 47613;
 export const STT_PARTITION = "persist:cybercall-stt";
 
 /** file — имя на диске и в адресе локального сервера, remote — имя в релизе (если отличается) */
-interface Asset { file: string; remote?: string; size: number; sha256: string; type: string; }
+interface Asset { file: string; remote?: string; base?: string; size: number; sha256: string; type: string; }
 
 /** Модели прошлых версий: удаляются после загрузки новой, чтобы не занимать место. */
 const OLD_FILES = ["model-ru.tar.gz"];
@@ -66,7 +66,7 @@ async function download(asset: Asset, onProgress: (percent: number) => void) {
         };
         alive();
         onProgress(0);
-        const res = await net.fetch(ASSET_URL + (asset.remote ?? asset.file), { signal: abort.signal }).catch(e => {
+        const res = await net.fetch((asset.base ?? ASSET_URL) + (asset.remote ?? asset.file), { signal: abort.signal }).catch(e => {
             throw new Error(abort.signal.aborted ? "GitHub не отвечает (проверь интернет или VPN)" : String(e?.message ?? e));
         });
         if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
@@ -128,6 +128,40 @@ export async function prepareStt(lang: string, onStatus: (text: string) => void)
     return { engine: paths[0], models: Object.fromEntries(langs.map((l, i) => [l, paths[i + 1]])) };
 }
 
+/*
+ * Точное распознавание (Whisper small): движок, файлы ONNX Runtime и модель. Список файлов
+ * с размерами и SHA-256 лежит в manifest.json релиза, а сам манифест закреплён здесь по хэшу.
+ */
+const WHISPER_URL = "https://github.com/SevereClaw/CyberCall/releases/download/stt-whisper-1/";
+const WHISPER_MANIFEST: Asset = {
+    file: "whisper-1-manifest.json", remote: "manifest.json", base: WHISPER_URL, type: "application/json",
+    size: 3329, sha256: "545f41bac7311b3235b1b09f9c0c8653222cc7ee16f455fcf1d2e4270b3c6e73"
+};
+const WHISPER_TYPES: Record<string, string> = {
+    ".js": "text/javascript", ".mjs": "text/javascript", ".wasm": "application/wasm",
+    ".json": "application/json", ".onnx": "application/octet-stream"
+};
+
+/** Скачивает всё для точного распознавания. Возвращает: путь, который запросит страница → файл на диске. */
+export async function prepareWhisper(onStatus: (percent: number) => void) {
+    const manifestPath = await ensure(WHISPER_MANIFEST, () => { });
+    const manifest = JSON.parse(await readFile(manifestPath, "utf-8"));
+    const entries = (manifest.files as { path: string; remote: string; size: number; sha256: string; }[])
+        .filter(f => /^\/(tf|ort|models\/whisper)\/[\w./-]+$/.test(f.path) && !f.path.includes("..") && /^[\w.-]+$/.test(f.remote));
+    const total = entries.reduce((a, f) => a + f.size, 0);
+    let before = 0;
+    const map: Record<string, string> = {};
+    for (const f of entries) {
+        const start = before;
+        map[f.path] = await ensure(
+            { file: "whisper-1-" + f.remote, remote: f.remote, base: WHISPER_URL, size: f.size, sha256: f.sha256, type: "" },
+            p => onStatus(Math.round((start + f.size * p / 100) / total * 100))
+        );
+        before += f.size;
+    }
+    return map;
+}
+
 let sessionReady = false;
 
 /** Отдельная сессия для окна с субтитрами: только ей разрешено слушать звук компьютера. */
@@ -157,6 +191,8 @@ export interface SttServer {
     /** false — порт занят, работаем на случайном и кэш модели между звонками не сохранится */
     stablePort: boolean;
     setFiles(files: SttFiles): void;
+    /** файлы точного распознавания: путь на сервере → файл на диске */
+    setWhisper(files: Record<string, string>): void;
     close(): void;
 }
 
@@ -173,6 +209,7 @@ function listen(server: Server, port: number) {
 /** Локальный сервер только для своего окна: страница оверлея, движок и модель. */
 export async function startSttServer(lang: string, token: string, getHtml: () => string): Promise<SttServer> {
     let files: SttFiles | null = null;
+    let whisper: Record<string, string> = {};
     const names = Object.fromEntries(sttLangs(lang).map(l => ["/" + MODELS[l].file, l]));
 
     const server = createServer((req, res) => {
@@ -180,26 +217,38 @@ export async function startSttServer(lang: string, token: string, getHtml: () =>
         const host = req.headers.host ?? "";
         const site = req.headers["sec-fetch-site"];
         // отвечаем только своей странице: никаких запросов с чужих сайтов и по чужому имени хоста
-        if (req.method !== "GET" || !/^127\.0\.0\.1:\d+$/.test(host) || (site && site !== "same-origin" && site !== "none")) {
+        if ((req.method !== "GET" && req.method !== "HEAD") || !/^127\.0\.0\.1:\d+$/.test(host) || (site && site !== "same-origin" && site !== "none")) {
             res.writeHead(403).end();
             return;
         }
 
+        // Изоляция страницы нужна, чтобы точное распознавание работало в несколько потоков
+        const isolation = {
+            "Cross-Origin-Opener-Policy": "same-origin",
+            "Cross-Origin-Embedder-Policy": "credentialless",
+            "Cross-Origin-Resource-Policy": "same-origin"
+        };
+
         if (url.pathname === "/overlay" && url.searchParams.get("t") === token) {
-            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...isolation });
             res.end(getHtml());
             return;
         }
 
-        const file = url.pathname === "/vosk.js" ? files?.engine : names[url.pathname] ? files?.models[names[url.pathname]] : null;
+        const w = whisper[url.pathname];
+        const file = w ?? (url.pathname === "/vosk.js" ? files?.engine : names[url.pathname] ? files?.models[names[url.pathname]] : null);
         if (!file) {
-            res.writeHead(404).end();
+            res.writeHead(404, isolation).end();
             return;
         }
         res.writeHead(200, {
-            "Content-Type": url.pathname === "/vosk.js" ? ENGINE.type : "application/gzip",
-            "Cache-Control": "no-store"
+            "Content-Type": w ? (WHISPER_TYPES[extname(url.pathname)] ?? "application/octet-stream")
+                : url.pathname === "/vosk.js" ? ENGINE.type : "application/gzip",
+            "Cache-Control": "no-store",
+            ...isolation
         });
+        // движок точного распознавания сначала проверяет файлы запросом HEAD
+        if (req.method === "HEAD") return void res.end();
         createReadStream(file).on("error", () => res.destroy()).pipe(res);
     });
 
@@ -218,6 +267,7 @@ export async function startSttServer(lang: string, token: string, getHtml: () =>
         modelUrls: Object.fromEntries(Object.entries(names).map(([path, l]) => [l, origin + path])),
         stablePort,
         setFiles: f => { files = f; },
+        setWhisper: f => { whisper = f; },
         close: () => {
             server.close();
             server.closeAllConnections?.();

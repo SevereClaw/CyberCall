@@ -12,7 +12,7 @@ import { extname, join } from "path";
 import defaultRingtone from "file://ringtone.mp3?base64";
 
 import { buildOverlayHtml, clampScale, CLOSE_MS, overlaySize } from "./overlay";
-import { prepareStt, startSttServer, STT_PARTITION, sttLangs, SttServer, sttSession } from "./stt";
+import { prepareStt, prepareWhisper, startSttServer, STT_PARTITION, sttLangs, SttServer, sttSession } from "./stt";
 import { RELEASE_URL, runUpdate } from "./updater";
 
 export interface ShowOptions {
@@ -35,6 +35,8 @@ export interface ShowOptions {
     /** субтитры речи собеседника в панели разговора */
     subtitles: boolean;
     subtitleLang: string;
+    /** high — точные субтитры через Whisper, fast — только Vosk */
+    captionQuality: string;
     /** моё окно: вторая панель с моим ником и аватаркой */
     ownCaptions: boolean;
     selfName: string;
@@ -324,7 +326,7 @@ async function openCall(o: ShowOptions) {
         await openMe(o, w, layout, subs).catch(err => log("моё окно не открылось: " + String((err as Error)?.message ?? err)));
         if (w.isDestroyed()) return;
     }
-    if (subs) startSubtitles(w, server, o.subtitleLang, mine, o.micLabel, o.outputLabel);
+    if (subs) startSubtitles(w, server, o.subtitleLang, mine, o.micLabel, o.outputLabel, o.captionQuality !== "fast");
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
@@ -393,8 +395,26 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
     }
 }
 
+/** Точные субтитры: докачивает Whisper (в первый раз ~280 МБ) и включает его в окне, пока Vosk уже работает. */
+function startWhisper(w: BrowserWindow, server: SttServer) {
+    let shown = -1;
+    prepareWhisper(p => {
+        if (p - shown < 10 || w.isDestroyed()) return;
+        shown = p;
+        log("точное распознавание: загрузка " + p + "%");
+        w.webContents.executeJavaScript(`cyberSubsStatus(${JSON.stringify("Загрузка точного распознавания… " + p + "% (черновые субтитры уже работают)")},2500)`).catch(() => { });
+    })
+        .then(files => {
+            if (w.isDestroyed()) return;
+            server.setWhisper(files);
+            const origin = new URL(server.engineUrl).origin;
+            w.webContents.executeJavaScript(`cyberWhisperStart(${JSON.stringify({ tfUrl: origin + "/tf/transformers.min.js", ortUrl: origin + "/ort/", modelsUrl: "/models/" })}).catch(e => document.title = "cybercall:log:" + encodeURIComponent("точное распознавание не запустилось: " + (e && e.message || e)) + ":" + Date.now())`).catch(() => { });
+        })
+        .catch(e => log("точное распознавание: не удалось скачать: " + String(e?.message ?? e)));
+}
+
 /** Докачивает распознавание при первом запуске и включает субтитры в окне. */
-function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, own: boolean, micLabel: string, outputLabel: string) {
+function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, own: boolean, micLabel: string, outputLabel: string, precise: boolean) {
     const exec = (js: string, gesture = false) => {
         if (!w.isDestroyed()) w.webContents.executeJavaScript(js, gesture).catch(() => { });
     };
@@ -409,6 +429,7 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
             exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, models: Object.entries(server.modelUrls).map(([lang, url]) => ({ lang, url })), own, micLabel, outputLabel })})`, true);
+            if (precise) startWhisper(w, server);
         })
         .catch(e => {
             const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);

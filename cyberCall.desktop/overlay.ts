@@ -182,20 +182,95 @@ const confOf = r => {
  * этот сигнал хоть раз, и запрещено ли слушать (микрофон выключен). Если Discord сигнал ни разу
  * не прислал, ориентируемся на громкость.
  */
+/*
+ * Точное распознавание (Whisper small). Vosk даёт текст сразу, пока человек говорит, а когда
+ * реплика закончилась, её звук целиком уходит в Whisper, и его вариант заменяет черновик.
+ * Whisper работает в отдельном потоке и обрабатывает реплики по очереди.
+ */
+let asr = null;
+const asrQueue = [];
+let asrBusy = false;
+const asrStats = { done: 0, ms: 0, skipped: 0 };
+// фразы, которые Whisper «слышит» в шуме и тишине
+const HALLUCINATIONS = /^(продолжение следует|субтитры (сделал|создавал|делал)|редактор субтитров|спасибо за просмотр|thank you( for watching)?|thanks for watching|you|bye|\.+|…)[.!…\s]*$/i;
+
+window.cyberWhisperStart = async cfg => {
+  const t0 = performance.now();
+  const { pipeline, env } = await import(cfg.tfUrl);
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  env.useBrowserCache = false;
+  env.localModelPath = cfg.modelsUrl;
+  env.backends.onnx.wasm.wasmPaths = cfg.ortUrl;
+  // половина ядер, но не больше четырёх: остальное — игре
+  const threads = crossOriginIsolated ? Math.max(1, Math.min(4, Math.floor((navigator.hardwareConcurrency || 2) / 2))) : 1;
+  env.backends.onnx.wasm.numThreads = threads;
+  env.backends.onnx.wasm.proxy = true;
+  asr = await pipeline("automatic-speech-recognition", "whisper", { dtype: "q8", device: "wasm" });
+  sendLog("точное распознавание включено: потоков " + threads + ", изоляция " + crossOriginIsolated + ", загрузка " + Math.round(performance.now() - t0) + " мс");
+  pumpAsr();
+};
+
+async function to16k(chunks, rate) {
+  const len = chunks.reduce((a, c) => a + c.length, 0);
+  const buf = new AudioBuffer({ length: len, sampleRate: rate, numberOfChannels: 1 });
+  let off = 0;
+  for (const c of chunks) { buf.copyToChannel(c, 0, off); off += c.length; }
+  if (rate === 16000) return buf.getChannelData(0);
+  const ctx = new OfflineAudioContext(1, Math.ceil(len * 16000 / rate), 16000);
+  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
+  return (await ctx.startRendering()).getChannelData(0);
+}
+
+async function pumpAsr() {
+  if (asrBusy || !asr || !asrQueue.length) return;
+  asrBusy = true;
+  const job = asrQueue.shift();
+  try {
+    // старые реплики уже неактуальны — не тратим на них процессор
+    if (Date.now() - job.at > 20000) { asrStats.skipped++; return; }
+    const audio = await to16k(job.chunks, job.rate);
+    const t0 = performance.now();
+    const out = await asr(audio, { language: job.lang === "en" ? "english" : "russian", task: "transcribe" });
+    asrStats.done++; asrStats.ms += performance.now() - t0;
+    const text = String(out && out.text || "").trim();
+    if (text && !HALLUCINATIONS.test(text) && job.isLatest()) job.show(text, true);
+  } catch (e) {
+    sendLog("ошибка точного распознавания: " + (e && e.message || e));
+  } finally {
+    asrBusy = false;
+    setTimeout(pumpAsr, 0);
+  }
+}
+
+function queueAsr(job) {
+  asrQueue.push(job);
+  // если реплики идут быстрее, чем Whisper успевает, пропускаем самые старые
+  while (asrQueue.length > 3) { asrQueue.shift(); asrStats.skipped++; }
+  pumpAsr();
+}
+
+/*
+ * Один слушатель = один поток звука со своими распознавателями (по одному на язык).
+ * signal() возвращает { on, ever, blocked }: говорит ли человек по данным Discord, приходил ли
+ * этот сигнал хоть раз, и запрещено ли слушать (микрофон выключен). Если Discord сигнал ни разу
+ * не прислал, ориентируемся на громкость.
+ */
 function makeListener(signal, show, stats) {
   let recs = [], recRate = 0, wasOpen = false, lastFlag = 0, lastSound = 0;
   // Сигнал «говорит» приходит с опозданием, и без запаса распознаватель теряет начало фразы.
   // Поэтому держим последние ~0,7 с звука и отдаём их, когда сигнал появился.
   let preroll = [], prerollLen = 0;
   /*
-   * Выбор языка (если моделей две). Обе модели слушают одну и ту же реплику — от начала речи
-   * до паузы. Пока реплика идёт, показываем текст модели, которая выигрывала в прошлый раз.
-   * Когда реплика закончилась, сравниваем среднюю уверенность моделей по всем словам реплики;
-   * если победила другая модель, заменяем текст на её вариант.
+   * Реплика — от начала речи до паузы. Если моделей Vosk две, обе слушают реплику: пока она
+   * идёт, показываем текст модели, которая выигрывала в прошлый раз, а в конце сравниваем
+   * среднюю уверенность моделей по словам; победивший язык уходит в Whisper.
    */
-  let favored = null, seg = null, segTimer = 0;
+  let favored = null, seg = null, segTimer = 0, segNo = 0;
   const lead = () => favored || recs[0].lang;
-  const newSeg = () => ({ by: {} });
+  // пока работает Whisper, текст Vosk — только черновик, он заменится точным вариантом
+  const draft = (text, final) => show(text, final && !asr);
+  const newSeg = () => ({ no: ++segNo, by: {}, audio: [], len: 0, rate: 0 });
   const segAdd = (lang, r) => {
     const s = seg.by[lang] = seg.by[lang] || { texts: [], conf: 0, words: 0 };
     const words = r.result || [];
@@ -203,42 +278,49 @@ function makeListener(signal, show, stats) {
     s.conf += words.reduce((a, w) => a + w.conf, 0);
     s.words += words.length;
   };
+  const sendToAsr = (done, lang) => {
+    if (!asr || !done.len || done.len < done.rate * 0.4) return;
+    const no = done.no;
+    queueAsr({ chunks: done.audio, rate: done.rate, lang, at: Date.now(), show, isLatest: () => segNo - no <= 1 });
+  };
   const closeSeg = () => {
     clearTimeout(segTimer);
     const done = seg; seg = null;
-    if (!done || recs.length < 2) return;
+    if (!done) return;
+    if (recs.length < 2) return sendToAsr(done, recs[0] ? recs[0].lang : "ru");
     const scored = Object.entries(done.by).filter(([, s]) => s.words)
       .map(([lang, s]) => ({ lang, text: s.texts.join(" "), conf: s.conf / s.words + (lang === lead() ? 0.05 : 0) }))
       .sort((a, b) => b.conf - a.conf);
     const best = scored[0];
-    if (!best) return;
+    if (!best) return sendToAsr(done, lead());
     stats.langs[best.lang] = (stats.langs[best.lang] || 0) + 1;
     if (best.lang !== lead()) {
       favored = best.lang;
-      if (best.conf >= MIN_CONF) show(best.text, true);
+      if (best.conf >= MIN_CONF) draft(best.text, true);
     }
+    sendToAsr(done, best.lang);
   };
 
   const onFinal = (lang, r) => {
     stats.loudSinceText = 0;
-    if (recs.length > 1) {
-      if (!seg) seg = newSeg();
-      segAdd(lang, r);
-      if (lang !== lead()) return;
-    }
+    if (recs.length > 1 && seg) segAdd(lang, r);
+    if (recs.length > 1 && lang !== lead()) return;
     if (!r.text) return;
     if (confOf(r) < MIN_CONF) { stats.dropped++; return; }
     stats.finals++;
-    show(r.text, true);
+    draft(r.text, true);
   };
 
   const onPartial = (lang, text) => {
     if (!text) return;
     stats.partials++; stats.loudSinceText = 0;
-    if (lang === lead()) show(text, false);
+    if (lang === lead()) draft(text, false);
   };
 
-  const feedAll = (data, rate) => { for (const r of recs) r.rec.acceptWaveformFloat(data, rate); };
+  const feedAll = (data, rate) => {
+    for (const r of recs) r.rec.acceptWaveformFloat(data, rate);
+    if (seg) { seg.audio.push(data); seg.len += data.length; seg.rate = rate; }
+  };
 
   return (samples, rate) => {
     if (!sttModels.length) return;
@@ -254,10 +336,10 @@ function makeListener(signal, show, stats) {
     if (!open) {
       // человек замолчал: дописываем тишину, чтобы распознаватель закончил фразу
       if (wasOpen && recs.length) {
-        feedAll(new Float32Array(Math.round(rate)), rate);
+        for (const r of recs) r.rec.acceptWaveformFloat(new Float32Array(Math.round(rate)), rate);
         // поздние результаты моделей ещё в пути — подводим итог реплики чуть позже
         clearTimeout(segTimer);
-        segTimer = setTimeout(closeSeg, 1500);
+        segTimer = setTimeout(closeSeg, asr && recs.length < 2 ? 300 : 1500);
       }
       wasOpen = false;
       if (!sig.blocked) {
@@ -280,10 +362,10 @@ function makeListener(signal, show, stats) {
     if (!wasOpen) {
       if (seg) closeSeg();
       seg = newSeg();
-    }
-    if (!wasOpen && preroll.length) {
-      for (const p of preroll) feedAll(p, rate);
-      stats.prerolls = (stats.prerolls || 0) + 1;
+      if (preroll.length) {
+        for (const p of preroll) feedAll(p, rate);
+        stats.prerolls = (stats.prerolls || 0) + 1;
+      }
     }
     preroll = []; prerollLen = 0;
     wasOpen = true;
@@ -297,6 +379,8 @@ function makeListener(signal, show, stats) {
       return;
     }
     feedAll(samples, rate);
+    // Whisper слушает не больше 30 секунд за раз — длинный монолог режем на куски
+    if (seg && seg.len > rate * 25) { closeSeg(); seg = newSeg(); }
   };
 }
 
@@ -316,8 +400,10 @@ const statLine = (title, st, ever) => {
     + (Object.keys(st.langs).length ? " языки=" + Object.entries(st.langs).map(([l, n]) => l + ":" + n).join(",") : "")
     + (st.restarts ? " перезапусков=" + st.restarts : "");
 };
+const asrLine = () => asr ? " | точно: фраз=" + asrStats.done + (asrStats.done ? " в среднем " + Math.round(asrStats.ms / asrStats.done) + " мс" : "")
+  + (asrStats.skipped ? " пропущено=" + asrStats.skipped : "") + " очередь=" + asrQueue.length : "";
 setInterval(() => {
-  const line = statLine("звук", sttStats, spokeEver) + (mineStats.blocks ? " | " + statLine("микрофон", mineStats, selfSpokeEver) : "");
+  const line = statLine("звук", sttStats, spokeEver) + (mineStats.blocks ? " | " + statLine("микрофон", mineStats, selfSpokeEver) : "") + asrLine();
   if (!sttStats.blocks || line === sttLogged || sttLogs >= 18) return;
   sttLogged = line; sttLogs++;
   sendLog(line);

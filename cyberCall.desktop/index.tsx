@@ -65,7 +65,7 @@ async function copyJournal() {
     const s = settings.store;
     const head = [
         "CyberCall " + await Native.getVersion().catch(() => "?"),
-        `настройки: субтитры=${s.captions}/${s.captionLang} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
+        `настройки: субтитры=${s.captions}/${s.captionLang}/${s.captionQuality} исходящий=${s.showOutgoing} разговор=${s.showInCall} рингтонИсх=${s.ringtoneOutgoing} глушить=${s.muteDiscordRing} громкость=${s.ringtoneVolume}`,
         ringMuterReport(),
         `события речи от Discord: ${speakEvents}, сейчас говорят: ${speakers.size}`
     ];
@@ -217,6 +217,14 @@ const settings = definePluginSettings({
         description: "Моё окно: во время разговора рядом с панелью собеседника такая же панель с моим ником и аватаркой. Оживает, когда говорю я; с включёнными субтитрами показывает и мою речь",
         default: true
     },
+    captionQuality: {
+        type: OptionType.SELECT,
+        description: "Точность субтитров. «Высокая»: после каждой фразы её перепроверяет нейросеть Whisper — ошибок примерно вдвое меньше, текст уточняется через пару секунд. При первом звонке скачает ~280 МБ, во время звонка занимает ещё ~700 МБ памяти и нагружает процессор, пока люди говорят",
+        options: [
+            { label: "Высокая (Whisper)", value: "high", default: true },
+            { label: "Обычная (быстрее и легче)", value: "fast" }
+        ]
+    },
     captionLang: {
         type: OptionType.SELECT,
         description: "Язык субтитров. «Оба» сам выбирает язык каждой фразы, но занимает вдвое больше памяти (около 800 МБ во время звонка)",
@@ -353,6 +361,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         mePosY: s.mePosY,
         ...selfInfo(),
         subtitleLang: s.captionLang as string,
+        captionQuality: s.captionQuality as string,
         ringtonePath: s.ringtonePath,
         ringtoneVolume: s.ringtoneVolume,
         ringtoneOutgoing: s.ringtoneOutgoing
