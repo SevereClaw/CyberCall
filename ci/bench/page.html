@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8">
+<script src="/vosk.js"></script>
+<script type="module">
+import { pipeline, env } from "/tf/transformers.min.js";
+env.allowRemoteModels = false;
+env.allowLocalModels = true;
+env.localModelPath = "/models/";
+env.backends.onnx.wasm.wasmPaths = "/ort/";
+env.backends.onnx.wasm.numThreads = Math.min(4, navigator.hardwareConcurrency || 2);
+
+async function audio16k(url) {
+  const ctx = new AudioContext({ sampleRate: 16000 });
+  const buf = await ctx.decodeAudioData(await (await fetch(url)).arrayBuffer());
+  ctx.close();
+  return buf.getChannelData(0);
+}
+
+let asr = null;
+window.loadWhisper = async (name, device) => {
+  const t0 = performance.now();
+  asr = await pipeline("automatic-speech-recognition", "onnx-community/" + name, { dtype: "q8", device });
+  return Math.round(performance.now() - t0);
+};
+window.whisper = async (url, lang) => {
+  const a = await audio16k(url);
+  const t0 = performance.now();
+  const out = await asr(a, { language: lang === "ru" ? "russian" : "english", task: "transcribe" });
+  return { text: out.text, ms: Math.round(performance.now() - t0), sec: a.length / 16000 };
+};
+
+const voskModels = {};
+window.vosk = async (url, lang) => {
+  voskModels[lang] = voskModels[lang] || await Vosk.createModel(lang === "ru" ? "/model-ru.tar.gz" : "/model-en.tar.gz", -1);
+  const a = await audio16k(url);
+  const rec = new voskModels[lang].KaldiRecognizer(16000);
+  const parts = [];
+  let done;
+  const finished = new Promise(r => (done = r));
+  rec.on("result", m => { if (m.result.text) parts.push(m.result.text); });
+  const t0 = performance.now();
+  for (let i = 0; i < a.length; i += 4096) rec.acceptWaveformFloat(a.slice(i, i + 4096), 16000);
+  rec.acceptWaveformFloat(new Float32Array(16000), 16000);
+  rec.retrieveFinalResult();
+  await new Promise(r => setTimeout(r, Math.max(1500, a.length / 16)));
+  rec.remove();
+  return { text: parts.join(" "), ms: Math.round(performance.now() - t0), sec: a.length / 16000 };
+};
+window.ready = true;
+</script>

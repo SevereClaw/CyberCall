@@ -1,0 +1,39 @@
+name: STT bench
+
+# Сравнение точности и скорости распознавателей на реальной речи (FLEURS, русский и английский).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["ci/bench/**", ".github/workflows/stt-bench.yml"]
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Prepare
+        run: |
+          W=$PWD/work; mkdir -p $W/tf $W/ort
+          cp ci/bench/page.html $W/
+          npm pack @huggingface/transformers@4.3.2 >/dev/null && tar xzf huggingface-transformers-4.3.2.tgz
+          cp package/dist/transformers.min.js $W/tf/
+          ORT=$(node -p "require('./package/package.json').dependencies['onnxruntime-web']")
+          rm -rf package && npm pack onnxruntime-web@$ORT >/dev/null && tar xzf onnxruntime-web-*.tgz
+          cp package/dist/ort-wasm-simd-threaded*.wasm package/dist/ort-wasm-simd-threaded*.mjs $W/ort/
+          ls -la $W/ort
+          rm -rf package && npm pack vosk-browser@0.0.8 >/dev/null && tar xzf vosk-browser-0.0.8.tgz && cp package/dist/vosk.js $W/
+          curl -sL --fail -o $W/model-ru.tar.gz https://github.com/${{ github.repository }}/releases/download/stt-2/model-ru.tar.gz
+          curl -sL --fail -o $W/model-en.tar.gz https://github.com/${{ github.repository }}/releases/download/stt-2/model-en.tar.gz
+          pip install -q huggingface_hub
+          python ci/bench/prepare.py $W 12
+          du -sh $W/models/onnx-community/*/onnx/*
+      - name: Bench
+        run: |
+          npm install --no-save playwright@1
+          npx playwright install --with-deps chromium
+          node ci/bench/bench.mjs $PWD/work
