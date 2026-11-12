@@ -73,6 +73,15 @@ async function copyJournal() {
     showNotification({ title: "CyberCall", body: "Журнал скопирован. Вставь его в чат.", noPersist: true });
 }
 
+function resetWindows() {
+    const s = settings.store;
+    s.position = "top-left";
+    s.scale = 100;
+    s.meScale = 0;
+    s.meCustom = false;
+    showNotification({ title: "CyberCall", body: "Окна вернутся на место при следующем звонке.", noPersist: true });
+}
+
 function VersionLine() {
     const [version, setVersion] = useState("…");
     useEffect(() => { Native.getVersion().then(setVersion, () => setVersion("?")); }, []);
@@ -110,7 +119,7 @@ const settings = definePluginSettings({
     },
     position: {
         type: OptionType.SELECT,
-        description: "Место на экране. Панель можно просто перетащить мышкой — место запомнится",
+        description: "Место на экране. Панель можно просто перетащить мышкой — место запомнится. Своё окно и окно собеседника двигаются отдельно",
         options: [
             { label: "Своё место (куда перетащил)", value: "custom" },
             { label: "Слева сверху", value: "top-left", default: true },
@@ -147,6 +156,10 @@ const settings = definePluginSettings({
     },
     posX: { type: OptionType.NUMBER, description: "X панели", default: 0, hidden: true },
     posY: { type: OptionType.NUMBER, description: "Y панели", default: 0, hidden: true },
+    meScale: { type: OptionType.NUMBER, description: "Размер моего окна, %", default: 0, hidden: true },
+    meCustom: { type: OptionType.BOOLEAN, description: "Моё окно перетаскивали", default: false, hidden: true },
+    mePosX: { type: OptionType.NUMBER, description: "X моего окна", default: 0, hidden: true },
+    mePosY: { type: OptionType.NUMBER, description: "Y моего окна", default: 0, hidden: true },
     layout: {
         type: OptionType.SELECT,
         description: "Вид панели",
@@ -157,7 +170,7 @@ const settings = definePluginSettings({
     },
     scale: {
         type: OptionType.SLIDER,
-        description: "Размер панели, %",
+        description: "Размер панели, %. Проще менять прямо на панели: Ctrl + колесо мыши (у каждого окна свой размер)",
         markers: [50, 75, 100, 125, 150, 200],
         default: 100,
         stickToMarkers: false
@@ -228,6 +241,7 @@ const settings = definePluginSettings({
                     <Button onClick={() => showTest("talk")}>Тест разговора</Button>
                     <Button variant="secondary" onClick={() => checkUpdate(true)}>Проверить обновления</Button>
                     <Button variant="secondary" onClick={() => copyJournal()}>Скопировать журнал</Button>
+                    <Button variant="secondary" onClick={() => resetWindows()}>Сбросить места и размеры окон</Button>
                 </div>
                 <VersionLine />
             </div>
@@ -319,6 +333,10 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
         monitor: s.monitor as string,
         subtitles: s.captions,
         ownCaptions: s.ownCaptions,
+        meScale: s.meScale,
+        meCustom: s.meCustom,
+        mePosX: s.mePosX,
+        mePosY: s.mePosY,
         ...selfInfo(),
         subtitleLang: s.subtitleLang as string,
         ringtonePath: s.ringtonePath,
@@ -563,12 +581,25 @@ export default definePlugin({
         log(String(text));
     },
 
-    /** Вызывается из главного процесса: панель перетащили на новое место. */
-    onOverlayMoved(x: number, y: number) {
+    /** Вызывается из главного процесса: окно перетащили на новое место. */
+    onOverlayMoved(which: "call" | "me", x: number, y: number) {
         if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-        settings.store.posX = Math.round(x);
-        settings.store.posY = Math.round(y);
-        settings.store.position = "custom";
+        if (which === "me") {
+            settings.store.mePosX = Math.round(x);
+            settings.store.mePosY = Math.round(y);
+            settings.store.meCustom = true;
+        } else {
+            settings.store.posX = Math.round(x);
+            settings.store.posY = Math.round(y);
+            settings.store.position = "custom";
+        }
+    },
+
+    /** Вызывается из главного процесса: размер окна поменяли колесом мыши. */
+    onOverlayScaled(which: "call" | "me", percent: number) {
+        if (!Number.isFinite(percent)) return;
+        if (which === "me") settings.store.meScale = Math.round(percent);
+        else settings.store.scale = Math.round(percent);
     },
 
     /** Вызывается из главного процесса: нажата кнопка или горячая клавиша. */

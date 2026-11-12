@@ -20,7 +20,11 @@ export interface OverlayData {
     scale: number;
     /** показывать строку субтитров и подключить распознавание речи (только для разговора) */
     subs?: boolean;
-    /** моё окно: такая же панель, как у собеседника, но с моим ником и аватаркой (только для разговора) */
+    /** call — панель звонка/собеседника, me — отдельное окно с моей панелью */
+    view?: "call" | "me";
+    /** в окне звонка: распознавать и мою речь с микрофона (текст уходит в моё окно) */
+    own?: boolean;
+    /** данные моей панели для view = "me" */
     me?: { name: string; sub: string; avatar: string; } | null;
     /** название готовой палитры или "custom" */
     theme?: string;
@@ -93,17 +97,11 @@ export function clampScale(scale: number) {
     return Math.min(2, Math.max(0.5, Number(scale) || 1));
 }
 
-/**
- * Размер окна оверлея. С «моим окном» панелей две: в обычном виде они стоят друг под другом,
- * в крупном — рядом. Под каждой может быть строка субтитров.
- */
-export function overlaySize(layout: "compact" | "big", scale: number, subs = false, me = false) {
+/** Размер одного окна оверлея: панель и, если включены субтитры, строка под ней. */
+export function overlaySize(layout: "compact" | "big", scale: number, subs = false) {
     const key = layout === "big" ? "big" : "compact", p = PANEL[key], s = clampScale(scale);
-    const column = p.height + (subs ? GAP + SUBS_HEIGHT[key] : 0);
-    const columns = me ? 2 : 1;
-    const width = key === "big" ? p.width * columns + GAP * (columns - 1) : p.width;
-    const height = key === "big" ? column : column * columns + GAP * (columns - 1);
-    return { width: Math.ceil((width + PAD * 2) * s), height: Math.ceil((height + PAD * 2) * s) };
+    const height = p.height + (subs ? GAP + SUBS_HEIGHT[key] : 0);
+    return { width: Math.ceil((p.width + PAD * 2) * s), height: Math.ceil((height + PAD * 2) * s) };
 }
 
 /** Длительность анимации закрытия, мс */
@@ -122,8 +120,7 @@ function esc(s: string) {
  */
 const SUBS_SCRIPT = String.raw`
 const subsEl = document.getElementById("subs"), whoEl = subsEl.querySelector(".who"), txtEl = subsEl.querySelector(".txt");
-const mineEl = document.getElementById("mine");
-let subsTimer = 0, mineTimer = 0;
+let subsTimer = 0;
 const subsHideIn = ms => { clearTimeout(subsTimer); subsTimer = setTimeout(() => subsEl.classList.remove("on"), ms); };
 const sendLog = text => { document.title = "cybercall:log:" + encodeURIComponent(text) + ":" + Date.now(); };
 const nice = text => { text = String(text || "").trim(); return text ? text[0].toUpperCase() + text.slice(1) : ""; };
@@ -142,18 +139,13 @@ const caption = (text, final) => {
   subsEl.className = "subs on";
   subsHideIn(final ? 6000 : 10000);
 };
-// мои слова — в строке под моей панелью
+// мои слова уходят в моё окно (его показывает главный процесс)
 const mineShow = (who, text, status, hold) => {
-  if (!mineEl) return;
-  mineEl.querySelector(".who").textContent = who;
-  mineEl.querySelector(".txt").textContent = text;
-  mineEl.className = "subs" + (text ? " on" : "") + (status ? " status" : "");
-  clearTimeout(mineTimer);
-  if (hold) mineTimer = setTimeout(() => mineEl.classList.remove("on"), hold);
+  document.title = "cybercall:mine:" + encodeURIComponent(JSON.stringify([who, text, !!status, hold || 0])) + ":" + Date.now();
 };
 const mineCaption = (text, final) => {
   text = nice(text);
-  if (text) mineShow(document.getElementById("myName").textContent, text, false, final ? 6000 : 10000);
+  if (text) mineShow("@", text, false, final ? 6000 : 10000);
 };
 const mineStatus = (text, hold) => mineShow("", text, true, hold);
 onSelfMuted = muted => { if (muted) mineStatus("Микрофон выключен — твоя речь не распознаётся", 4000); };
@@ -359,7 +351,7 @@ window.cyberSubsStart = async cfg => {
   }
 
   // 1. Мой микрофон (заодно после этого система отдаёт названия устройств)
-  if (mineEl) {
+  if (cfg.own) {
     try {
       const mic = await withTimeout(captureMic(cfg.micLabel), 15000, "микрофон не ответил");
       micLabel = cleanLabel(mic.getAudioTracks()[0].label);
@@ -414,7 +406,7 @@ export function buildOverlayHtml(d: OverlayData) {
     const talk = d.mode === "talk";
     const big = d.layout === "big";
     const t = resolveTheme(d.theme, d.accent);
-    const me = talk && d.me ? d.me : null;
+    const me = d.view === "me" && d.me ? d.me : null;
     const avatarHtml = (url: string) => `<div class="ava">
         <img class="base" src="${esc(url)}" alt="">
         <img class="gr" src="${esc(url)}" alt="">
@@ -441,7 +433,6 @@ export function buildOverlayHtml(d: OverlayData) {
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;font-family:var(--font)}
 body{display:flex;flex-direction:column;align-items:flex-start;gap:${GAP}px;padding:${PAD}px;zoom:${clampScale(d.scale)}}
-body.big{flex-direction:row}
 .col{flex:none;display:flex;flex-direction:column;gap:${GAP}px}
 .panel{cursor:grab}
 body.dragging .panel,body.dragging button{cursor:grabbing}
@@ -630,7 +621,27 @@ body.no .panel::before{background:var(--r)}
   79%{opacity:.9;transform:translate(-2px,0);clip-path:inset(0 0 65% 0)}81%{opacity:0}}
 </style></head>
 <body class="mode-${esc(d.mode)}${big ? " big" : ""}">
-<div class="col">
+${me ? `<div class="col">
+<div class="wrap me" id="wMe">
+  <div class="panel">
+    <div class="corner"></div>
+    <div class="tag">HOLO // SELF</div>
+    <div class="content">
+      ${avatarHtml(me.avatar)}
+      <div class="info">
+        <div class="label"><b></b><span class="on-live">ЭТО ТЫ</span><span class="on-muted">МИКРОФОН ВЫКЛЮЧЕН</span></div>
+        <div class="name" id="myName" data-t="${esc(me.name)}">${esc(me.name)}</div>
+        <div class="sub">${esc(me.sub)}</div>
+        <div class="wave">${bars}</div>
+        <div class="btns">
+          <button class="ghost" data-a="mic"><span class="on-live">ВЫКЛЮЧИТЬ МИКРОФОН</span><span class="on-muted">ВКЛЮЧИТЬ МИКРОФОН</span></button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+${d.subs ? '<div class="subs" id="mine"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
+</div>` : `<div class="col">
 <div class="wrap" id="wOther">
   <div class="panel">
     <div class="corner"></div>
@@ -654,28 +665,7 @@ body.no .panel::before{background:var(--r)}
   </div>
 </div>
 ${d.subs ? '<div class="subs" id="subs"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
-</div>
-${me ? `<div class="col">
-<div class="wrap me" id="wMe">
-  <div class="panel">
-    <div class="corner"></div>
-    <div class="tag">HOLO // SELF</div>
-    <div class="content">
-      ${avatarHtml(me.avatar)}
-      <div class="info">
-        <div class="label"><b></b><span class="on-live">ЭТО ТЫ</span><span class="on-muted">МИКРОФОН ВЫКЛЮЧЕН</span></div>
-        <div class="name" id="myName" data-t="${esc(me.name)}">${esc(me.name)}</div>
-        <div class="sub">${esc(me.sub)}</div>
-        <div class="wave">${bars}</div>
-        <div class="btns">
-          <button class="ghost" data-a="mic"><span class="on-live">ВЫКЛЮЧИТЬ МИКРОФОН</span><span class="on-muted">ВКЛЮЧИТЬ МИКРОФОН</span></button>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>
-${d.subs ? '<div class="subs" id="mine"><div><span class="who"></span><span class="txt"></span></div></div>' : ""}
-</div>` : ""}
+</div>`}
 <script>
 // Клик по кнопке передаётся в главный процесс через заголовок окна.
 document.querySelectorAll("button").forEach(b =>
@@ -686,7 +676,30 @@ let speaking = false, lastVoice = 0, spokeEver = false;
 window.cyberSpeak = on => {
   speaking = !!on;
   if (speaking) { lastVoice = Date.now(); spokeEver = true; }
-  document.getElementById("wOther").classList.toggle("speaking", speaking);
+  const w = document.getElementById("wOther");
+  if (w) w.classList.toggle("speaking", speaking);
+};
+// Ctrl + колесо мыши над окном меняет его размер (считает и запоминает главный процесс)
+let wheelAt = 0;
+window.addEventListener("wheel", e => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  const now = Date.now();
+  if (now - wheelAt < 40) return;
+  wheelAt = now;
+  document.title = "cybercall:zoom:" + (e.deltaY < 0 ? "in" : "out") + ":" + now;
+}, { passive: false });
+window.cyberZoom = scale => { document.body.style.zoom = scale; };
+// Моё окно: текст моей речи приходит из окна звонка, где работает распознавание
+let myCapTimer = 0;
+window.cyberMineShow = (who, text, status, hold) => {
+  const el = document.getElementById("mine");
+  if (!el) return;
+  el.querySelector(".who").textContent = who === "@" ? document.getElementById("myName").textContent : who;
+  el.querySelector(".txt").textContent = text;
+  el.className = "subs" + (text ? " on" : "") + (status ? " status" : "");
+  clearTimeout(myCapTimer);
+  if (hold) myCapTimer = setTimeout(() => el.classList.remove("on"), hold);
 };
 // Моё окно: сигналы «я говорю» и «я выключил микрофон» от Discord
 const wMe = document.getElementById("wMe");
@@ -738,7 +751,7 @@ document.querySelectorAll(".panel").forEach(panel => {
   panel.addEventListener("lostpointercapture", endDrag);
 });
 
-${d.subs ? SUBS_SCRIPT : ""}
+${d.subs && !me ? SUBS_SCRIPT : ""}
 let audio = null;
 window.cyberClose = kind => {
   document.body.classList.add("out", kind === "accept" ? "ok" : kind === "decline" ? "no" : "x");

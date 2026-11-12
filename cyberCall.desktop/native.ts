@@ -43,6 +43,11 @@ export interface ShowOptions {
     selfMuted: boolean;
     /** название микрофона, выбранного в Discord */
     micLabel: string;
+    /** моё окно: свой размер (в процентах) и своё место, если его перетаскивали */
+    meScale: number;
+    meCustom: boolean;
+    mePosX?: number;
+    mePosY?: number;
     /** на каком мониторе показывать, если панель стоит в углу */
     monitor: string;
     ringtonePath: string;
@@ -59,7 +64,13 @@ const MIME: Record<string, string> = {
     ".m4a": "audio/mp4", ".flac": "audio/flac", ".opus": "audio/ogg", ".webm": "audio/webm"
 };
 
+type Which = "call" | "me";
+
+/** окно звонка (панель собеседника) и отдельное окно с моей панелью */
 let win: BrowserWindow | null = null;
+let meWin: BrowserWindow | null = null;
+/** что нужно знать об окне, чтобы менять его размер колесом мыши */
+const info = new WeakMap<BrowserWindow, { which: Which; layout: "compact" | "big"; subs: boolean; scale: number; }>();
 let owner: WebContents | null = null;
 let keys: string[] = [];
 
@@ -124,8 +135,84 @@ function stopDrag(save: boolean) {
     const [wx, wy] = d.w.getPosition();
     const { x, y } = fitToScreen(wx, wy, width, height);
     d.w.setBounds({ x, y, width, height });
+    const which = info.get(d.w)?.which ?? "call";
     if (owner && !owner.isDestroyed())
-        owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onOverlayMoved(${x},${y})`).catch(() => { });
+        owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onOverlayMoved(${JSON.stringify(which)},${x},${y})`).catch(() => { });
+}
+
+/** Ctrl + колесо: меняем размер окна, левый верхний угол остаётся на месте. */
+function zoom(w: BrowserWindow, direction: "in" | "out") {
+    const i = info.get(w);
+    if (!i || w.isDestroyed()) return;
+    const scale = clampScale(Math.round((i.scale + (direction === "in" ? 0.05 : -0.05)) * 100) / 100);
+    if (scale === i.scale) return;
+    i.scale = scale;
+
+    const { x, y } = w.getBounds();
+    const { width, height } = overlaySize(i.layout, scale, i.subs);
+    const pos = fitToScreen(x, y, width, height);
+    w.setBounds({ ...pos, width, height });
+    w.webContents.executeJavaScript(`cyberZoom(${scale})`).catch(() => { });
+    if (owner && !owner.isDestroyed())
+        owner.executeJavaScript(`Vencord.Plugins.plugins.CyberCall.onOverlayScaled(${JSON.stringify(i.which)},${Math.round(scale * 100)})`).catch(() => { });
+}
+
+function createWindow(bounds: { x: number; y: number; width: number; height: number; }, partition?: string) {
+    const w = new BrowserWindow({
+        ...bounds,
+        frame: false,
+        transparent: true,
+        backgroundColor: "#00000000",
+        resizable: false,
+        movable: false,
+        minimizable: false,
+        maximizable: false,
+        fullscreenable: false,
+        skipTaskbar: true,
+        hasShadow: false,
+        focusable: false, // не отбирает фокус у игры
+        alwaysOnTop: true,
+        show: false,
+        webPreferences: {
+            sandbox: true,
+            contextIsolation: true,
+            nodeIntegration: false,
+            backgroundThrottling: false,
+            autoplayPolicy: "no-user-gesture-required",
+            ...(partition ? { partition } : {})
+        }
+    });
+    w.setAlwaysOnTop(true, "screen-saver");
+    w.setMenu(null);
+
+    // Оверлей никуда не переходит и не открывает окна
+    w.webContents.on("will-navigate", ev => ev.preventDefault());
+    w.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+
+    // Страница общается с главным процессом через заголовок окна
+    w.webContents.on("page-title-updated", (ev, title) => {
+        ev.preventDefault();
+        if (title.startsWith("cybercall:log:")) {
+            try { log("панель: " + decodeURIComponent(title.slice(14).replace(/:\d+$/, ""))); } catch { }
+            return;
+        }
+        if (title.startsWith("cybercall:mine:")) {
+            // текст моей речи из окна звонка — в моё окно
+            try {
+                const [who, text, status, hold] = JSON.parse(decodeURIComponent(title.slice(15).replace(/:\d+$/, "")));
+                if (meWin && !meWin.isDestroyed())
+                    meWin.webContents.executeJavaScript(`cyberMineShow(${JSON.stringify(String(who))},${JSON.stringify(String(text))},${status ? "true" : "false"},${Number(hold) || 0})`).catch(() => { });
+            } catch { }
+            return;
+        }
+        const m = /^cybercall:(accept|decline|dismiss|mic|dragstart|dragend|zoom):(in|out)?/.exec(title);
+        if (!m) return;
+        if (m[1] === "dragstart") startDrag(w);
+        else if (m[1] === "dragend") stopDrag(true);
+        else if (m[1] === "zoom") zoom(w, m[2] === "in" ? "in" : "out");
+        else notify(m[1] as Action);
+    });
+    return w;
 }
 
 function startDrag(w: BrowserWindow) {
@@ -159,12 +246,16 @@ export async function showCall(e: IpcMainInvokeEvent, o: ShowOptions) {
 
 async function openCall(o: ShowOptions) {
     destroy(win);
+    destroy(meWin);
+    meWin = null;
     releaseKeys();
 
     const subs = o.mode === "talk" && !!o.subtitles;
     if (subs) sttSession();
     const mine = o.mode === "talk" && !!o.ownCaptions;
-    const { width, height } = overlaySize(o.layout, o.scale / 100, subs, mine);
+    const layout = o.layout === "big" ? "big" : "compact";
+    const scale = clampScale(o.scale / 100);
+    const { width, height } = overlaySize(layout, scale, subs);
     const area = pickDisplay(o.monitor).workArea;
     let pos = {
         x: o.position.endsWith("right") ? area.x + area.width - width : area.x,
@@ -173,36 +264,8 @@ async function openCall(o: ShowOptions) {
     if (o.position === "custom" && Number.isFinite(o.posX) && Number.isFinite(o.posY))
         pos = fitToScreen(o.posX!, o.posY!, width, height);
 
-    const w = win = new BrowserWindow({
-        width,
-        height,
-        x: pos.x,
-        y: pos.y,
-        frame: false,
-        transparent: true,
-        backgroundColor: "#00000000",
-        resizable: false,
-        movable: false,
-        minimizable: false,
-        maximizable: false,
-        fullscreenable: false,
-        skipTaskbar: true,
-        hasShadow: false,
-        focusable: false, // не отбирает фокус у игры
-        alwaysOnTop: true,
-        show: false,
-        webPreferences: {
-            sandbox: true,
-            contextIsolation: true,
-            nodeIntegration: false,
-            backgroundThrottling: false,
-            autoplayPolicy: "no-user-gesture-required",
-            ...(subs ? { partition: STT_PARTITION } : {})
-        }
-    });
-
-    w.setAlwaysOnTop(true, "screen-saver");
-    w.setMenu(null);
+    const w = win = createWindow({ ...pos, width, height }, subs ? STT_PARTITION : undefined);
+    info.set(w, { which: "call", layout, subs, scale });
     w.on("closed", () => {
         if (win === w) {
             win = null;
@@ -210,29 +273,10 @@ async function openCall(o: ShowOptions) {
         }
     });
 
-    // Оверлей никуда не переходит и не открывает окна
-    w.webContents.on("will-navigate", ev => ev.preventDefault());
-    w.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-
-    w.webContents.on("page-title-updated", (ev, title) => {
-        ev.preventDefault();
-        const m = /^cybercall:(accept|decline|dismiss|mic|dragstart|dragend):/.exec(title);
-        if (title.startsWith("cybercall:log:")) {
-            try { log("панель: " + decodeURIComponent(title.slice(14).replace(/:\d+$/, ""))); } catch { }
-            return;
-        }
-        if (!m) return;
-        if (m[1] === "dragstart") startDrag(w);
-        else if (m[1] === "dragend") stopDrag(true);
-        else notify(m[1] as Action);
-    });
-
     const html = buildOverlayHtml({
         name: o.name, sub: o.sub, avatar: o.avatar, mode: o.mode, startedAt: o.startedAt,
         acceptKey: o.acceptKey, declineKey: o.declineKey,
-        layout: o.layout === "big" ? "big" : "compact", scale: clampScale(o.scale / 100),
-        theme: o.theme, accent: o.accent, subs,
-        me: mine ? { name: o.selfName, sub: o.selfSub, avatar: o.selfAvatar } : null
+        layout, scale, theme: o.theme, accent: o.accent, subs, own: mine
     });
 
     // Для субтитров странице нужен «настоящий» адрес: с data:-страницы нельзя слушать звук и грузить модель
@@ -273,8 +317,12 @@ async function openCall(o: ShowOptions) {
     // В разговоре клавиши не перехватываем: панель висит весь звонок, а клавиша нужна игре
     if (o.mode !== "talk") grabKey(o.declineKey, "decline");
 
-    if (mine && o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
-    if (subs) startSubtitles(w, server, o.subtitleLang, mine ? o.micLabel : "");
+    if (mine) {
+        if (o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
+        await openMe(o, w, layout, subs).catch(err => log("моё окно не открылось: " + String((err as Error)?.message ?? err)));
+        if (w.isDestroyed()) return;
+    }
+    if (subs) startSubtitles(w, server, o.subtitleLang, mine, o.micLabel);
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
@@ -299,18 +347,52 @@ async function openCall(o: ShowOptions) {
         w.webContents.executeJavaScript(`cyberRing(${JSON.stringify(b64)},${JSON.stringify(mime)},${vol})`).catch(() => { });
 }
 
+/** Моё окно: отдельная панель с моим ником и аватаркой, её можно двигать и масштабировать независимо. */
+async function openMe(o: ShowOptions, call: BrowserWindow, layout: "compact" | "big", subs: boolean) {
+    const scale = clampScale((o.meScale || o.scale) / 100);
+    const { width, height } = overlaySize(layout, scale, subs);
+
+    // По умолчанию — вплотную к окну собеседника: в обычном виде снизу, в крупном справа.
+    // Если там нет места на экране — с другой стороны.
+    const c = call.getBounds();
+    const screenArea = screen.getDisplayMatching(c).bounds;
+    let pos = layout === "big"
+        ? { x: c.x + c.width + width <= screenArea.x + screenArea.width ? c.x + c.width - 20 : c.x - width + 20, y: c.y }
+        : { x: c.x, y: c.y + c.height + height <= screenArea.y + screenArea.height ? c.y + c.height - 20 : c.y - height + 20 };
+    if (o.meCustom && Number.isFinite(o.mePosX) && Number.isFinite(o.mePosY)) pos = { x: o.mePosX!, y: o.mePosY! };
+    pos = fitToScreen(pos.x, pos.y, width, height);
+
+    const w = meWin = createWindow({ ...pos, width, height });
+    info.set(w, { which: "me", layout, subs, scale });
+    w.on("closed", () => {
+        if (meWin === w) meWin = null;
+    });
+
+    const html = buildOverlayHtml({
+        view: "me", name: "", sub: "", avatar: "", mode: "talk",
+        acceptKey: "", declineKey: "", layout, scale, theme: o.theme, accent: o.accent, subs,
+        me: { name: o.selfName, sub: o.selfSub, avatar: o.selfAvatar }
+    });
+    await w.loadURL("data:text/html;charset=utf-8," + encodeURIComponent(html));
+    if (w.isDestroyed()) return;
+    if (o.selfMuted) w.webContents.executeJavaScript("cyberSelfMuted(true)").catch(() => { });
+    w.showInactive();
+}
+
 export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "missed") {
     releaseKeys();
-    const w = win;
+    const windows = [win, meWin];
     win = null;
-    if (!w || w.isDestroyed()) return;
-
-    w.webContents.executeJavaScript(`cyberClose(${JSON.stringify(kind)})`).catch(() => { });
-    setTimeout(() => destroy(w), CLOSE_MS + 60);
+    meWin = null;
+    for (const w of windows) {
+        if (!w || w.isDestroyed()) continue;
+        w.webContents.executeJavaScript(`cyberClose(${JSON.stringify(kind)})`).catch(() => { });
+        setTimeout(() => destroy(w), CLOSE_MS + 60);
+    }
 }
 
 /** Докачивает распознавание при первом запуске и включает субтитры в окне. */
-function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, micLabel: string) {
+function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, own: boolean, micLabel: string) {
     const exec = (js: string, gesture = false) => {
         if (!w.isDestroyed()) w.webContents.executeJavaScript(js, gesture).catch(() => { });
     };
@@ -324,7 +406,7 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
             log("субтитры: файлы готовы, запускаю распознавание (" + sttLang(lang) + ")");
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
-            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, micLabel })})`, true);
+            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, own, micLabel })})`, true);
         })
         .catch(e => {
             const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);
@@ -342,14 +424,19 @@ export function setSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
     run(`cyberSpeak(${speaking ? "true" : "false"})`);
 }
 
-/** Я начал или перестал говорить (для моего окна с субтитрами). */
+function runBoth(js: string) {
+    for (const w of [win, meWin])
+        if (w && !w.isDestroyed()) w.webContents.executeJavaScript(js).catch(() => { });
+}
+
+/** Я начал или перестал говорить: моей панели — для анимации, окну звонка — для распознавания моей речи. */
 export function setSelfSpeaking(_: IpcMainInvokeEvent, speaking: boolean) {
-    run(`window.cyberSelfSpeak&&cyberSelfSpeak(${speaking ? "true" : "false"})`);
+    runBoth(`window.cyberSelfSpeak&&cyberSelfSpeak(${speaking ? "true" : "false"})`);
 }
 
 /** Я выключил или включил микрофон. */
 export function setSelfMuted(_: IpcMainInvokeEvent, muted: boolean) {
-    run(`window.cyberSelfMuted&&cyberSelfMuted(${muted ? "true" : "false"})`);
+    runBoth(`window.cyberSelfMuted&&cyberSelfMuted(${muted ? "true" : "false"})`);
 }
 
 /** В групповом звонке сменился говорящий. */
