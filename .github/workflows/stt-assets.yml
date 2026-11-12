@@ -1,26 +1,28 @@
 name: STT assets
 
 # Служебный релиз с файлами распознавания речи для субтитров (движок и языковые модели).
-# Плагин скачивает их сам при первом включении субтитров. Запускается один раз:
-# если релиз уже есть, ничего не делает.
+# Плагин скачивает их сам при первом включении субтитров. Перед публикацией модели проверяются
+# в настоящем браузере на синтезированной речи. Если релиз уже есть, ничего не делает.
 
 on:
   push:
     branches: [main]
-    paths: [".github/workflows/stt-assets.yml"]
+    paths: [".github/workflows/stt-assets.yml", "ci/stt-test.mjs"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  TAG: stt-1
+  TAG: stt-2
   MODELS_COMMIT: a4b0d0fe60359e5ea9800f810f6b6f6c1d2b03c6
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Skip if already published
         id: check
         env:
@@ -33,30 +35,47 @@ jobs:
       - name: Collect files
         if: steps.check.outputs.exists != 'true'
         run: |
+          mkdir work && cd work
           npm pack vosk-browser@0.0.8
           tar xzf vosk-browser-0.0.8.tgz
           cp package/dist/vosk.js vosk.js
           BASE="https://raw.githubusercontent.com/ccoreilly/vosk-browser/$MODELS_COMMIT/models"
-          curl -L --fail -o model-ru.tar.gz "$BASE/vosk-model-small-ru-0.4.tar.gz"
           curl -L --fail -o model-en.tar.gz "$BASE/vosk-model-small-en-us-0.15.tar.gz"
-          # те же контрольные суммы зашиты в плагине (stt.ts)
-          sha256sum -c <<'SUMS'
-          29504515526e974f4cb053cf08811c4de5fb2a74007c0a5a957db50eaa8d5d0c  vosk.js
-          b855cf79a513023af4090739caa407203754d7db98ccb3b8d4162f5d7f6a3f8e  model-ru.tar.gz
-          f0b24bb92a48ca575b6a96500d6b543f0f079c573dfe85bbe16001fc0404e1d8  model-en.tar.gz
-          SUMS
+          curl -L --fail -o model-ru-old.tar.gz "$BASE/vosk-model-small-ru-0.4.tar.gz"
+          echo "29504515526e974f4cb053cf08811c4de5fb2a74007c0a5a957db50eaa8d5d0c  vosk.js" | sha256sum -c
+          echo "f0b24bb92a48ca575b6a96500d6b543f0f079c573dfe85bbe16001fc0404e1d8  model-en.tar.gz" | sha256sum -c
+          # более новая русская модель с сайта авторов Vosk, в том же виде (tar.gz с одной папкой внутри)
+          curl -L --fail -o ru.zip https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip
+          unzip -q ru.zip
+          tar czf model-ru.tar.gz vosk-model-small-ru-0.22
+          rm -rf package ru.zip vosk-model-small-ru-0.22 vosk-browser-0.0.8.tgz
+
+      - name: Test models in a real browser
+        if: steps.check.outputs.exists != 'true'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq espeak-ng
+          espeak-ng -v ru -s 135 -w work/ru-test.wav "привет, как дела. что ты делаешь сегодня вечером. давай пойдём играть в новую игру. я сейчас включу компьютер и позвоню тебе"
+          espeak-ng -v en-us -s 140 -w work/en-test.wav "hello how are you today. let us play a new game tonight. i will call you in five minutes"
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+          node ci/stt-test.mjs work ru-test.wav model-ru-old.tar.gz model-ru.tar.gz
+          node ci/stt-test.mjs work en-test.wav model-en.tar.gz
 
       - name: Publish
         if: steps.check.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cd work
+          sha256sum vosk.js model-ru.tar.gz model-en.tar.gz
+          stat -c "%n %s" vosk.js model-ru.tar.gz model-en.tar.gz
           cat > notes.md <<'NOTES'
           Служебный релиз: эти файлы плагин скачивает сам, когда включены субтитры. Вручную ставить ничего не нужно.
 
           - `vosk.js` — движок распознавания vosk-browser 0.0.8 (Apache-2.0), https://github.com/ccoreilly/vosk-browser
-          - `model-ru.tar.gz` — vosk-model-small-ru-0.4 (Apache-2.0), https://alphacephei.com/vosk/models
+          - `model-ru.tar.gz` — vosk-model-small-ru-0.22 (Apache-2.0), https://alphacephei.com/vosk/models
           - `model-en.tar.gz` — vosk-model-small-en-us-0.15 (Apache-2.0), https://alphacephei.com/vosk/models
+          - `ru-test.wav`, `en-test.wav` — синтезированная речь, на которой модели проверялись перед публикацией
           NOTES
-          gh release create "$TAG" vosk.js model-ru.tar.gz model-en.tar.gz -R "$GITHUB_REPOSITORY" \
-            --title "Файлы распознавания речи для субтитров" --notes-file notes.md --latest=false
+          gh release create "$TAG" vosk.js model-ru.tar.gz model-en.tar.gz ru-test.wav en-test.wav -R "$GITHUB_REPOSITORY" \
+            --title "Файлы распознавания речи для субтитров (v2)" --notes-file notes.md --latest=false
