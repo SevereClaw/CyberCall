@@ -315,6 +315,7 @@ function selfInfo() {
         selfSub: me ? "@" + me.username : "",
         selfAvatar: me ? absolute(IconUtils.getUserAvatarURL(me, true, 256)) : FALLBACK_AVATAR,
         selfMuted: isSelfMuted(),
+        outputLabel: outputDeviceName(),
         micLabel
     };
 }

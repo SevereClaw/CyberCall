@@ -325,7 +325,23 @@ function dropSource(src) {
   src.nodes[1].onaudioprocess = null;
 }
 
-let decideTries = 0;
+let decideTries = 0, voiceHint = "";
+
+/** Подсказка, куда направить звук Discord, с учётом его устройства вывода и микрофона. */
+function makeVoiceHint(output, mic) {
+  output = cleanLabel(output || "");
+  mic = cleanLabel(mic || "");
+  const busOf = s => (/Voicemeeter Out (B\d)/i.exec(s) || [])[1];
+  if (/voicemeeter/i.test(output)) {
+    const strip = /aux/i.test(output) ? "AUX" : /vaio3|VAIO 3|B3/i.test(output) ? "VAIO3" : "Voicemeeter VAIO";
+    const micBus = busOf(mic);
+    const bus = ["B3", "B1", "B2"].find(b => b !== micBus);
+    return "Голос собеседника не слышен плагину. Discord выводит звук в «" + shortLabel(output) + "»: в Voicemeeter на полосе "
+      + strip + " включи шину " + bus + (micBus ? " (не " + micBus + " — это твой микрофон в Discord, собеседник услышит сам себя)" : "");
+  }
+  return "Голос собеседника не слышен плагину. Discord выводит звук в «" + shortLabel(output || "?")
+    + "» — выбери в Discord устройство вывода по умолчанию или направь этот звук в устройство записи";
+}
 const shortLabel = label => label.replace(/\s*\((VB-Audio[^)]*|[^)]*WDM[^)]*)\)\s*$/, "");
 
 function decideSource() {
@@ -350,7 +366,8 @@ function decideSource() {
     // голоса нет ни в одном источнике: продолжаем слушать все — вдруг маршрут поменяют прямо во время звонка
     if (decideTries === 1) {
       sendLog("голос собеседника не найден ни в одном источнике");
-      cyberSubsStatus("Голос собеседника не слышен плагину. Направь звук Discord в шину записи (в Voicemeeter — кнопка B2 на полосе Discord)", 30000);
+      cyberSubsStatus(voiceHint || makeVoiceHint("", ""), 45000);
+      sendLog("подсказка: " + (voiceHint || makeVoiceHint("", "")));
     }
     remoteSources.forEach(s => { s.on = s.onN = s.off = s.offN = 0; });
     return;
@@ -367,6 +384,7 @@ function decideSource() {
 
 window.cyberSubsStart = async cfg => {
   let ctx = null, micLabel = "";
+  voiceHint = makeVoiceHint(cfg.outputLabel, cfg.micLabel);
   try {
     cyberSubsStatus("Запуск распознавания речи…");
     await cyberSubsInit(cfg);

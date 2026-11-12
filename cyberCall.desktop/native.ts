@@ -43,6 +43,8 @@ export interface ShowOptions {
     selfMuted: boolean;
     /** название микрофона, выбранного в Discord */
     micLabel: string;
+    /** устройство вывода звука Discord */
+    outputLabel: string;
     /** моё окно: свой размер (в процентах) и своё место, если его перетаскивали */
     meScale: number;
     meCustom: boolean;
@@ -322,7 +324,7 @@ async function openCall(o: ShowOptions) {
         await openMe(o, w, layout, subs).catch(err => log("моё окно не открылось: " + String((err as Error)?.message ?? err)));
         if (w.isDestroyed()) return;
     }
-    if (subs) startSubtitles(w, server, o.subtitleLang, mine, o.micLabel);
+    if (subs) startSubtitles(w, server, o.subtitleLang, mine, o.micLabel, o.outputLabel);
 
     // В разговоре рингтон не нужен; для исходящего — только если включено в настройках
     if (o.mode === "talk" || (o.mode === "out" && !o.ringtoneOutgoing)) return;
@@ -392,7 +394,7 @@ export function hideCall(_: IpcMainInvokeEvent, kind: Action | "missed" = "misse
 }
 
 /** Докачивает распознавание при первом запуске и включает субтитры в окне. */
-function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, own: boolean, micLabel: string) {
+function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string, own: boolean, micLabel: string, outputLabel: string) {
     const exec = (js: string, gesture = false) => {
         if (!w.isDestroyed()) w.webContents.executeJavaScript(js, gesture).catch(() => { });
     };
@@ -406,7 +408,7 @@ function startSubtitles(w: BrowserWindow, server: SttServer | null, lang: string
             log("субтитры: файлы готовы, запускаю распознавание (" + sttLang(lang) + ")");
             server.setFiles(files);
             // userGesture = true: захват звука разрешён только «по действию пользователя»
-            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, own, micLabel })})`, true);
+            exec(`cyberSubsStart(${JSON.stringify({ engineUrl: server.engineUrl, modelUrl: server.modelUrl, own, micLabel, outputLabel })})`, true);
         })
         .catch(e => {
             const text = "Не удалось скачать распознавание речи: " + String(e?.message ?? e);
