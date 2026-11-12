@@ -439,6 +439,11 @@ export function setSelfMuted(_: IpcMainInvokeEvent, muted: boolean) {
     runBoth(`window.cyberSelfMuted&&cyberSelfMuted(${muted ? "true" : "false"})`);
 }
 
+/** Собеседник вышел из звонка (панель становится серой) или вернулся. */
+export function setRemoteGone(_: IpcMainInvokeEvent, gone: boolean) {
+    run(`window.cyberGone&&cyberGone(${gone ? "true" : "false"})`);
+}
+
 /** В групповом звонке сменился говорящий. */
 export function setSpeaker(_: IpcMainInvokeEvent, info: { name: string; sub: string; avatar: string; }) {
     run(`cyberUser(${JSON.stringify(String(info.name))},${JSON.stringify(String(info.sub))},${JSON.stringify(String(info.avatar))})`);

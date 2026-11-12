@@ -9,7 +9,7 @@ import { copyToClipboard } from "@utils/clipboard";
 import { relaunch } from "@utils/native";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByPropsLazy } from "@webpack";
-import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore, useEffect, useState, MediaEngineStore } from "@webpack/common";
+import { CallStore, ChannelStore, IconUtils, RestAPI, SelectedChannelStore, UserStore, useEffect, useState, MediaEngineStore, VoiceStateStore } from "@webpack/common";
 
 import { THEMES } from "./overlay";
 import { installRingMuter, ringMuterReport, setRingMuted, uninstallRingMuter } from "./muteRing";
@@ -313,6 +313,7 @@ function show(channelId: string, mode: Mode, info: { name: string; sub: string; 
     shownChannelId = channelId;
     shownMode = mode;
     shownSpeaker = null;
+    shownGone = false;
     const s = settings.store;
     const ownRingtone = s.ringtoneVolume > 0 && (mode === "in" || (mode === "out" && s.ringtoneOutgoing));
     setRingMuted(ownRingtone && channelId !== TEST_ID && s.muteDiscordRing);
@@ -461,6 +462,8 @@ function sync() {
         setTimeout(sync, OUTGOING_GRACE - sinceJoin + 50);
     }
 
+    pushGone();
+
     const state = `звонков=${calls.length} [${calls.map(c => `гудки:${c.ringing?.length ?? 0}${c.ringing?.includes(meId) ? "(мне)" : ""}`).join(" ")}] я в голосе=${Boolean(voiceId)} в звонке=${Boolean(voiceId && live.has(voiceId))} → входящий=${ringing.size} исходящий=${Boolean(outgoing)} разговор=${Boolean(talk)}`;
     if (state !== lastSyncState) log(lastSyncState = state);
 
@@ -486,8 +489,35 @@ function sync() {
         else if (talk) {
             show(talk, "talk", describe(talk));
             pushSpeaking();
+            // окно ещё открывается — состояние «отключён» передаём, когда оно готово
+            setTimeout(pushGone, 900);
         }
     }
+}
+
+/** показана ли панель разговора серой («собеседник отключён») */
+let shownGone = false;
+
+/** В звонке, кроме меня, никого не осталось? */
+function nobodyElse(channelId: string) {
+    try {
+        const meId = UserStore.getCurrentUser()?.id;
+        const states = VoiceStateStore.getVoiceStatesForChannel(channelId) ?? {};
+        return !Object.keys(states).some(id => id !== meId);
+    } catch {
+        return false;
+    }
+}
+
+/** Красит панель разговора в серый, когда собеседник вышел из звонка, и возвращает цвет, когда он вернулся. */
+function pushGone() {
+    if (shownMode !== "talk" || !shownChannelId || shownChannelId === TEST_ID) return;
+    const gone = nobodyElse(shownChannelId);
+    if (gone === shownGone) return;
+    shownGone = gone;
+    log(gone ? "собеседник вышел из звонка" : "собеседник снова в звонке");
+    if (gone) speakers.clear();
+    Native.setRemoteGone(gone);
 }
 
 /** Передаёт в панель разговора, говорит ли сейчас собеседник и кто именно. */
@@ -538,6 +568,14 @@ function onSelfMute() {
     }, 80);
 }
 
+/** Кто-то вошёл в голосовой канал или вышел: событий много, поэтому сверяемся не чаще раза в 150 мс. */
+let voiceStatesTimer: ReturnType<typeof setTimeout> | undefined;
+function onVoiceStates() {
+    if (shownMode !== "talk" || !shownChannelId) return;
+    clearTimeout(voiceStatesTimer);
+    voiceStatesTimer = setTimeout(pushGone, 150);
+}
+
 const scheduleSync = () => { setTimeout(sync, 60); };
 
 export default definePlugin({
@@ -551,6 +589,7 @@ export default definePlugin({
         CALL_UPDATE: scheduleSync,
         CALL_DELETE: scheduleSync,
         VOICE_CHANNEL_SELECT: scheduleSync,
+        VOICE_STATE_UPDATES: onVoiceStates,
         SPEAKING: onSpeaking,
         AUDIO_TOGGLE_SELF_MUTE: onSelfMute,
         AUDIO_TOGGLE_SELF_DEAF: onSelfMute,

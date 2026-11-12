@@ -573,6 +573,17 @@ button:active{transform:translateY(1px)}
 .subs.status{font-size:12px;letter-spacing:.08em;font-weight:400;color:rgb(var(--c-rgb) / .9);border-left-color:var(--c)}
 body.out .subs{opacity:0;transition:opacity .12s}
 
+/* ---------- собеседник вышел из звонка: панель серая ---------- */
+.on-gone{display:none}
+.wrap.gone .on-live{display:none}
+.wrap.gone .on-gone{display:inline}
+.wrap.gone{filter:grayscale(1) brightness(.72)}
+.wrap.gone .label{color:#aeb6bf}
+.wrap.gone .label b{background:#8a929b;box-shadow:none}
+.wrap.gone .ava .base{filter:grayscale(1) brightness(.5)}
+.wrap.gone .name{color:#aeb6bf;text-shadow:none}
+.wrap,.wrap .ava .base{transition:filter .35s}
+
 /* ---------- моё окно: та же панель, но про меня ---------- */
 .wrap.me .label b{background:#39ff88;box-shadow:0 0 8px #39ff88}
 .wrap.me.muted .label{color:var(--r)}
@@ -650,7 +661,7 @@ ${d.subs ? '<div class="subs" id="mine"><div><span class="who"></span><span clas
     <div class="content">
       ${avatarHtml(d.avatar)}
       <div class="info">
-        <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : talk ? 'НА СВЯЗИ<span class="timer" id="timer">00:00</span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
+        <div class="label"><b></b>${out ? 'ИСХОДЯЩИЙ ВЫЗОВ<span class="dots"><i>.</i><i>.</i><i>.</i></span>' : talk ? '<span class="on-live">НА СВЯЗИ</span><span class="on-gone">ОТКЛЮЧЁН</span><span class="timer" id="timer">00:00</span>' : "ВХОДЯЩИЙ ВЫЗОВ"}</div>
         <div class="name" id="name" data-t="${name}">${name}</div>
         <div class="sub" id="sub">${esc(d.sub)}</div>
         <div class="wave">${bars}</div>
@@ -678,6 +689,13 @@ window.cyberSpeak = on => {
   if (speaking) { lastVoice = Date.now(); spokeEver = true; }
   const w = document.getElementById("wOther");
   if (w) w.classList.toggle("speaking", speaking);
+};
+// Собеседник вышел из звонка или вернулся
+window.cyberGone = on => {
+  const w = document.getElementById("wOther");
+  if (!w) return;
+  w.classList.toggle("gone", !!on);
+  if (on) { speaking = false; w.classList.remove("speaking"); }
 };
 // Ctrl + колесо мыши над окном меняет его размер (считает и запоминает главный процесс)
 let wheelAt = 0;
