@@ -621,10 +621,10 @@ export function buildOverlayHtml(d: OverlayData) {
     const t = resolveTheme(d.theme, d.accent);
     const me = d.view === "me" && d.me ? d.me : null;
     const avatarHtml = (url: string) => `<div class="ava">
-        <img class="base" src="${esc(url)}" alt="">
-        <img class="gr" src="${esc(url)}" alt="">
-        <img class="gc" src="${esc(url)}" alt="">
-        <img class="slice" src="${esc(url)}" alt="">
+        <img class="base" src="${esc(url)}" alt="" draggable="false">
+        <img class="gr" src="${esc(url)}" alt="" draggable="false">
+        <img class="gc" src="${esc(url)}" alt="" draggable="false">
+        <img class="slice" src="${esc(url)}" alt="" draggable="false">
         <div class="tint"></div><div class="lines"></div><div class="boot"></div>
       </div>`;
     const name = esc(d.name);
@@ -647,7 +647,8 @@ export function buildOverlayHtml(d: OverlayData) {
 html,body{width:100%;height:100%;background:transparent;overflow:hidden;user-select:none;font-family:var(--font)}
 body{display:flex;flex-direction:column;align-items:flex-start;gap:${GAP}px;padding:${PAD}px;zoom:${clampScale(d.scale)}}
 .col{flex:none;display:flex;flex-direction:column;gap:${GAP}px}
-.panel{cursor:grab}
+.panel{cursor:grab;touch-action:none}
+img{-webkit-user-drag:none}
 body.dragging .panel,body.dragging button{cursor:grabbing}
 
 /* ---------- каркас ---------- */
@@ -1013,6 +1014,10 @@ if (timer) {
 }
 
 // Перетаскивание: страница только сообщает о начале и конце, окно двигает главный процесс.
+// Встроенное перетаскивание браузера (картинки аватарки) выключено: когда компьютер занят
+// (игра, распознавание речи), окно чуть отстаёт от курсора, курсор съезжает по аватарке,
+// браузер начинал тащить картинку и отменял наше перетаскивание (pointercancel).
+document.addEventListener("dragstart", e => e.preventDefault());
 let dragging = false;
 const endDrag = () => {
   if (!dragging) return;
